@@ -24,12 +24,21 @@ THE FIX. Move every TRUSTED operation into the PARENT, and run only `kernel_fn` 
 
 What this CLOSES: in-process correctness forgery, seed-read, scorer-state monkeypatching, the
 sitecustomize / PYTHON* / os.system paths affecting the verdict, OOM/crash on a locked size (= a
-stage FAIL), and garbage-on-replay. The child trap is defense-in-depth; the load-bearing check is
-the parent's oracle over the whole suite.
+stage FAIL), garbage-on-replay, and memoize-and-replay (incl. the padded variant). The timed loop
+mutates its input before every call so a content cache must recompute (honest timing); a parent
+oracle-checks a kernel-unknowable sample of timed outputs so a pointer cache returning a stale answer
+is caught; and an absolute roofline floor rejects any physically-impossible median. The child trap is
+defense-in-depth; the load-bearing checks are the parent's oracle over the whole suite + the floor.
+
+Cost of the mutation: one extra Triton-store launch per timed call adds a small, FIXED latency
+(launch overhead, exposed only for very fast kernels). It is identical for the champion and the
+challenger, so the relative win test is unbiased; it slightly raises the minimum *detectable*
+improvement, which also damps crown-thrash on negligible wins.
 
 Residual (documented): a kernel that is genuinely correct but under-reports its CUDA-event timing
-from inside the child. The parent wall-clock tripwire rejects the impossible case (claimed GPU time
-> wall time); full immunity needs parent-driven two-point wall-clock timing, a follow-up.
+from inside the child. The parent wall-clock tripwire + roofline floor reject the impossible cases
+(claimed GPU time > wall, or below the hardware bound); full immunity needs parent-driven two-point
+wall-clock timing, a follow-up.
 
 Usage (needs a CUDA GPU + torch/triton; run in the Linux/WSL env):
     ~/cco-gpu/bin/python cco/isolate.py --self-test
@@ -96,6 +105,14 @@ def _child_main(job_path: str, out_path: str) -> int:
     def cuda_in(inp):
         return {k: (v.to("cuda") if hasattr(v, "to") else v) for k, v in inp.items()}
 
+    def clone_gpu(o):  # async GPU clone (no host sync) — cheap enough to capture inside the loop
+        if isinstance(o, (tuple, list)):
+            return type(o)(clone_gpu(x) for x in o)
+        return o.detach().clone()
+
+    def clone_in(d):
+        return {k: (v.detach().clone() if hasattr(v, "detach") else v) for k, v in d.items()}
+
     delegation = None
     child_error = None
     task_outputs = []
@@ -103,6 +120,10 @@ def _child_main(job_path: str, out_path: str) -> int:
     scored_val = []
     event_block_us: list[float] = []
     timed_wall_s = 0.0
+    probe_in_gpu: list = []   # captured (input, output) of a parent-chosen, kernel-unknowable sample
+    probe_out_gpu: list = []  # of TIMED calls; the parent oracle-checks them (defeats a stale cache)
+    probe_inputs: list = []   # ^ the same, moved to CPU for the parent after the timed window
+    probe_outputs: list = []
 
     try:
         # --- correctness tasks (smoke / sweep / stability / edge): run once each ---
@@ -130,30 +151,81 @@ def _child_main(job_path: str, out_path: str) -> int:
 
         # --- scored size: EVERY call (pre-val / warmup / timed / post-val) runs under the trap, so
         #     there is no untrapped phase in which a kernel could delegate; a banned op ANYWHERE here
-        #     raises DelegationError and is caught below. ---
+        #     raises DelegationError and is caught below.
+        #     The TIMED loop runs on a SEPARATE buffer set whose content is MUTATED in place before
+        #     every call (one element write, unique per call): a content-addressed cache misses and
+        #     must recompute (honest timing), while a pointer-addressed cache returns a now-STALE
+        #     output. To catch the latter, a parent-chosen, kernel-UNKNOWABLE sample of timed calls
+        #     has its (mutated input, output) captured for the parent to oracle-check. Pre/post-val
+        #     use the CLEAN buffers (never mutated), so the correct-then-garbage check is unaffected. ---
         if delegation is None:
             sc = job["scored"]
-            bufs = [cuda_in(b) for b in sc["buffers"]]
+            bufs = [cuda_in(b) for b in sc["buffers"]]              # clean: pre/post validation only
             nb = len(bufs)
             n_pre = int(sc["n_pre"])
             rep = int(sc["rep"])
-            with delegation_trap():
+            n_blk = int(sc["n_blocks"])
+            tbufs = [cuda_in(b) for b in sc["timed_buffers"]]       # separate storage: mutated while timing
+            ntb = len(tbufs)
+            mut_key = sc["mut_key"]
+            cap_blocks = set(sc.get("capture_blocks") or [])
+            cap_rep = int(sc.get("cap_rep", 0))
+
+            # Per-call input mutation via a tiny TRITON store, NOT a torch op: a torch setitem would be
+            # intercepted by the delegation trap (~tens of us of Python per call) and make the CPU, not
+            # the kernel, the bottleneck for fast kernels. A Triton launch bypasses the torch dispatcher
+            # — the trap never sees it — and the destination views are built once, outside the trap. It
+            # writes a MONOTONICALLY growing value to element 0 before every timed call: the value at a
+            # captured (late) call is therefore far from the value at the buffer's first touch, so a
+            # pointer-cache that replays its first-touch output is stale in row 0 by a wide margin —
+            # detectable at ANY track tolerance — while a content-cache must recompute (honest timing).
+            # Element 0 (vs a rotating index) keeps the store a single un-specialized Triton kernel.
+            import triton
+            import triton.language as tl
+
+            @triton.jit
+            def _mut_k(PTR, VAL):
+                tl.store(PTR, VAL)
+
+            _flats = [tb[mut_key].view(-1) for tb in tbufs]
+            _do_mut = (bool(_flats) and hasattr(tbufs[0].get(mut_key), "is_floating_point")
+                       and tbufs[0][mut_key].is_floating_point())
+
+            def mutate(buf_idx, gi):                                # 1 Triton launch, no trapped torch op
+                if _do_mut:                                        # 37 + gi: monotonic, bounded < fp16 max
+                    _mut_k[(1,)](_flats[buf_idx], float(37 + gi % 60000))
+
+            g = 0                                                   # global timed-call index
+            with delegation_trap() as _trap_verify:
                 for i in range(min(n_pre, nb)):
                     scored_val.append(_to_cpu(kernel_fn(**bufs[i])))
 
                 for _ in range(int(sc["warmup"])):
-                    kernel_fn(**bufs[0])
+                    mutate(0, g)
+                    g += 1
+                    kernel_fn(**tbufs[0])
                 _sync()
                 s = _Event(enable_timing=True)
                 e = _Event(enable_timing=True)
                 _t0 = _perf()
-                for _blk in range(int(sc["n_blocks"])):
+                for blk in range(n_blk):
+                    _trap_verify()         # between blocks: catch a kernel that popped the trap mid-loop
+                    is_cap = blk in cap_blocks
                     s.record()
                     for r in range(rep):
-                        kernel_fn(**bufs[r % nb])
+                        tb = tbufs[g % ntb]
+                        mutate(g % ntb, g)
+                        grab = is_cap and r == cap_rep
+                        in_clone = clone_in(tb) if grab else None   # the exact input handed to the kernel
+                        out = kernel_fn(**tb)
+                        if grab:
+                            probe_in_gpu.append(in_clone)
+                            probe_out_gpu.append(clone_gpu(out))
+                        g += 1
                     e.record()
                     _sync()
-                    event_block_us.append(s.elapsed_time(e) * 1000.0 / rep)
+                    if not is_cap:                                  # capture blocks pay clone cost -> untimed
+                        event_block_us.append(s.elapsed_time(e) * 1000.0 / rep)
                 # Captured-clock wall of the whole timed window: forge-resistant (the kernel cannot
                 # patch _perf or _sync here), so the parent anchors the cuda-event sample's scale to
                 # it — a kernel under-reporting events (e.g. side-stream evasion) is caught.
@@ -162,6 +234,10 @@ def _child_main(job_path: str, out_path: str) -> int:
                 for i in range(n_pre, nb):
                     scored_val.append(_to_cpu(kernel_fn(**bufs[i])))
                 _sync()
+
+            probe_inputs = [{k: (_to_cpu(v) if hasattr(v, "detach") else v) for k, v in p.items()}
+                            for p in probe_in_gpu]
+            probe_outputs = [_to_cpu(p) for p in probe_out_gpu]
     except DelegationError as ex:
         delegation = str(ex)
     except Exception as ex:
@@ -172,10 +248,12 @@ def _child_main(job_path: str, out_path: str) -> int:
 
     if delegation is not None:
         det_outputs, scored_val, event_block_us = [], [], []
+        probe_inputs, probe_outputs = [], []
 
     torch.save({"task_outputs": task_outputs, "det_outputs": det_outputs,
                 "scored_val": scored_val, "event_block_us": event_block_us,
                 "timed_wall_s": timed_wall_s, "delegation": delegation,
+                "probe_inputs": probe_inputs, "probe_outputs": probe_outputs,
                 "child_error": child_error}, out_path)
     return 0
 
@@ -189,9 +267,62 @@ def _repo_root() -> str:
     return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
+def _preload_so() -> "str | None":
+    """Resolve the Tier-2 LD_PRELOAD vendor-symbol trap (runtime/cco_preload.so), if built.
+
+    Honors $CCO_PRELOAD_SO; otherwise looks next to the repo's runtime/. Returns None when the .so is
+    absent (e.g. on a dev box where it was not compiled, or Windows) — the in-Python trap still runs;
+    the LD_PRELOAD backstop is an additive defense that the trusted GPU image always builds."""
+    env = os.environ.get("CCO_PRELOAD_SO")
+    if env and os.path.isfile(env):
+        return os.path.abspath(env)
+    cand = os.path.join(_repo_root(), "runtime", "cco_preload.so")
+    return cand if os.path.isfile(cand) else None
+
+
+_PRELOAD_SELFTEST = None  # None=unchecked, True=verified, str=failure reason (cached per process)
+
+
+def _assert_preload_interposes(preload: str) -> None:
+    """FAIL-CLOSED gate: confirm the LD_PRELOAD trap actually interposes a real `torch.mm` on THIS
+    host. If a plain matmul child does NOT _exit(99), interposition is broken (static-linked cuBLAS,
+    a renamed symbol, an RTLD quirk, a stale .so) and EVERY delegation would pass silently — so we
+    refuse to score rather than hand out a free pass. Runs once per process (cached)."""
+    global _PRELOAD_SELFTEST
+    if _PRELOAD_SELFTEST is True:
+        return
+    if isinstance(_PRELOAD_SELFTEST, str):
+        raise RuntimeError(_PRELOAD_SELFTEST)
+    import subprocess as _sp
+    probe = ("import torch;"
+             "a=torch.randn(64,64,device='cuda',dtype=torch.float16);"
+             "b=(a@a); torch.cuda.synchronize()")
+    env = {k: v for k, v in os.environ.items() if not k.startswith("PYTHON")}
+    existing = env.get("LD_PRELOAD", "")
+    env["LD_PRELOAD"] = f"{preload}:{existing}" if existing else preload
+    env["LD_BIND_NOW"] = "1"
+    try:
+        p = _sp.run([sys.executable, "-E", "-c", probe], env=env,
+                    capture_output=True, text=True, timeout=180)
+    except Exception as e:  # noqa: BLE001 - any failure to run the gate is fail-closed
+        _PRELOAD_SELFTEST = f"LD_PRELOAD self-test could not run ({type(e).__name__}: {e}); refusing to score"
+        raise RuntimeError(_PRELOAD_SELFTEST) from e
+    if p.returncode == 99:
+        _PRELOAD_SELFTEST = True
+        return
+    _PRELOAD_SELFTEST = (
+        f"LD_PRELOAD vendor trap is INERT: a plain torch.mm child exited {p.returncode}, not 99 — "
+        f"symbol interposition is broken on this host (static-linked cuBLAS / renamed symbol / stale "
+        f".so). Refusing to score: a delegating kernel would pass undetected. "
+        f"stderr tail: {(p.stderr or '')[-300:]}")
+    raise RuntimeError(_PRELOAD_SELFTEST)
+
+
 def run_isolated(kernel_path: str, config: dict, seed: int, compare_fn, *,
                  n_blocks: int = 30, warmup: int = 25, rep: int = 100,
-                 n_val: int = 6, quick: bool = False, timeout_s: float = 1200.0) -> dict:
+                 n_val: int = 6, n_timed: int = 4, quick: bool = False, timeout_s: float = 1200.0,
+                 peak_bw_gb_s: float = 0.0, peak_tflops: float = 0.0,
+                 floor_fraction: float = 0.8) -> dict:
     """Score `kernel_path` isolated; judge correctness HERE against the oracle over the full suite.
 
     `compare_fn(output, expected, atol, rtol, multi_output) -> {"match": bool, "max_abs_error": ..}`
@@ -265,12 +396,33 @@ def run_isolated(kernel_path: str, config: dict, seed: int, compare_fn, *,
         "inputs": {k: (v.detach().to("cpu") if hasattr(v, "detach") else v)
                    for k, v in det_inputs_gpu.items()}, "runs": 3}
 
-    # scored buffers (distinct seeds) for pre/post validation + timed rotation
+    # scored buffers (distinct seeds) — CLEAN, used only for pre/post-timing validation
     scored_bufs = [gen_fn(scored_size, dtypes[0], dev, seed=seed + 1000 + i) for i in range(n_val)]
     scored_oracles = [_to_cpu(ref_fn(b)) for b in scored_bufs]
     scored_cpu = [{k: (v.detach().to("cpu") if hasattr(v, "detach") else v) for k, v in b.items()}
                   for b in scored_bufs]
-    del scored_bufs, det_inputs_gpu
+
+    # TIMED buffers — separate storage; the child mutates one element before every timed call so a
+    # cache cannot make the median sub-real. The largest float input is the mutation target (the
+    # output depends on it; a cache that ignores it returns a stale, oracle-detectable output).
+    def _largest_float_key(d):
+        best, bn = None, -1
+        for k, v in d.items():
+            if hasattr(v, "is_floating_point") and v.is_floating_point() and v.numel() > bn:
+                best, bn = k, v.numel()
+        return best
+    mut_key = _largest_float_key(scored_cpu[0])
+    timed_bufs = [gen_fn(scored_size, dtypes[0], dev, seed=seed + 2000 + i) for i in range(max(1, n_timed))]
+    timed_cpu = [{k: (v.detach().to("cpu") if hasattr(v, "detach") else v) for k, v in b.items()}
+                 for b in timed_bufs]
+    # capture a kernel-unknowable sample of timed blocks (1 probe each), keeping >=1 timed block
+    k_cap = min(4, max(1, n_blocks // 5))
+    k_cap = min(k_cap, max(0, n_blocks - 1))
+    capture_blocks = sorted({min(n_blocks - 1, max(0, round(n_blocks * (j + 0.5) / k_cap)))
+                             for j in range(k_cap)}) if k_cap else []
+    cap_rep = rep // 2
+
+    del scored_bufs, timed_bufs, det_inputs_gpu
     torch.cuda.empty_cache()
 
     tmp = tempfile.mkdtemp(prefix="cco_isolate_")
@@ -284,16 +436,51 @@ def run_isolated(kernel_path: str, config: dict, seed: int, compare_fn, *,
         torch.save({"kernel_path": os.path.abspath(kernel_path), "tasks": tasks,
                     "determinism": determinism,
                     "scored": {"buffers": scored_cpu, "n_pre": n_val // 2,
-                               "warmup": warmup, "n_blocks": n_blocks, "rep": rep}}, job_path)
+                               "warmup": warmup, "n_blocks": n_blocks, "rep": rep,
+                               "timed_buffers": timed_cpu, "mut_key": mut_key,
+                               "capture_blocks": capture_blocks, "cap_rep": cap_rep}}, job_path)
 
-        boot = (f"import sys; sys.path.insert(0, {_repo_root()!r}); "
-                f"from cco.isolate import _child_main; _child_main(sys.argv[1], sys.argv[2])")
+        # Import torch FIRST (the real one from site-packages) and APPEND the repo root rather than
+        # inserting it at sys.path[0]. Otherwise a planted repo-root `torch.py` (or `triton.py`, ...)
+        # would be imported before the genuine package and defeat the capture-before-load timing
+        # defense. With torch already loaded and the repo root LAST on the path, nothing the child or
+        # the kernel imports can be shadowed by a top-level sibling of `kernel.py`.
+        boot = ("import sys, torch; "
+                f"sys.path.append({_repo_root()!r}); "
+                "from cco.isolate import _child_main; _child_main(sys.argv[1], sys.argv[2])")
         env = {k: v for k, v in os.environ.items() if not k.startswith("PYTHON")}
+        # Tier-2 backstop: LD_PRELOAD the vendor-symbol trap into the CHILD only (the parent must keep
+        # calling cuBLAS to compute the oracle). A delegated GEMM/conv that slips past the in-Python
+        # trap hits an interposed symbol -> the child records it to CCO_DELEGATION_LOG (inside the
+        # per-run tmp; absolute so the child cwd=tmp is irrelevant) and _exit(99).
+        preload = _preload_so()
+        deleg_flag = os.path.join(tmp, "delegation.flag")
+        if preload:
+            _assert_preload_interposes(preload)          # fail-closed gate: refuse to score if inert
+            existing = env.get("LD_PRELOAD", "")
+            env["LD_PRELOAD"] = f"{preload}:{existing}" if existing else preload
+            env["CCO_DELEGATION_LOG"] = deleg_flag
+            env["LD_BIND_NOW"] = "1"                      # eager binding (belt-and-suspenders)
         cmd = [sys.executable, "-E", "-c", boot, job_path, out_path]
 
         t0 = time.perf_counter()
         proc = subprocess.run(cmd, cwd=tmp, env=env, capture_output=True, text=True, timeout=timeout_s)
         child_wall_s = time.perf_counter() - t0
+
+        # Tier-2 vendor trap fired: exit 99 (unforgeable) OR the flag file was written. The flag FILE is
+        # the trusted symbol source (stderr is forgeable — a kernel can close fd 2 before delegating).
+        shim_sym = None
+        if os.path.exists(deleg_flag):
+            try:
+                with open(deleg_flag, encoding="utf-8") as f:
+                    shim_sym = f.read().strip() or None
+            except OSError:
+                pass
+        if proc.returncode == 99 or shim_sym:
+            return {**base, "correct": False, "max_abs_error": 0.0,
+                    "delegation": f"vendor symbol {shim_sym or 'unknown'} (LD_PRELOAD no-delegation trap)",
+                    "stages": fail_stages, "latencies_us": [], "median_us": 0.0, "mean_us": 0.0,
+                    "stdev_us": 0.0, "child_wall_s": child_wall_s}
 
         if proc.returncode != 0 or not os.path.exists(out_path):
             return {**base, "correct": False, "max_abs_error": 0.0, "delegation": None,
@@ -345,7 +532,7 @@ def run_isolated(kernel_path: str, config: dict, seed: int, compare_fn, *,
                     if not cmp["match"]:
                         stage_ok["determinism"] = False
 
-        # scored-size correctness (the timed inputs were validated too)
+        # scored-size correctness on the CLEAN pre/post-timing buffers (catches correct-then-garbage).
         scored_ok = True
         sval = res.get("scored_val") or []
         if len(sval) < n_val:
@@ -356,23 +543,57 @@ def run_isolated(kernel_path: str, config: dict, seed: int, compare_fn, *,
             if not cmp["match"]:
                 scored_ok = False
 
+        # TIMED-LOOP probe: each captured (mutated input, output) sample must match the oracle on that
+        # EXACT input. A cache that ignores the per-call mutation returns a stale -> wrong output here.
+        # Together with the roofline floor this closes memoize-and-replay incl. the padded variant
+        # (cache the answer, burn dummy time to clear the floor): the burned-time output is still stale.
+        probe_ok = True
+        pin = res.get("probe_inputs") or []
+        pout = res.get("probe_outputs") or []
+        if capture_blocks and res.get("event_block_us"):      # probes were requested and timing ran
+            if len(pout) < len(capture_blocks):
+                probe_ok = False
+            for pi, po in zip(pin, pout):
+                pin_gpu = {k: (v.to("cuda") if hasattr(v, "to") else v) for k, v in pi.items()}
+                exp = ref_fn(pin_gpu)
+                cmp = compare_fn(_to_cuda(po), exp, det_tol["atol"], det_tol["rtol"], multi)
+                worst_err = max(worst_err, cmp.get("max_abs_error", 0.0))
+                if not cmp["match"]:
+                    probe_ok = False
+
         def verdict(st):
             if not stage_seen[st]:
                 return "SKIP"
             return "PASS" if stage_ok[st] else "FAIL"
 
         stages = {k: verdict(k) for k in stage_ok}
-        overall = all(stage_ok[k] for k in stage_ok if stage_seen[k]) and scored_ok
+        overall = all(stage_ok[k] for k in stage_ok if stage_seen[k]) and scored_ok and probe_ok
         stages["correctness"] = "PASS" if overall else "FAIL"
 
         latencies_us = list(res.get("event_block_us") or [])
         timed_wall_s = float(res.get("timed_wall_s") or 0.0)
-        # Anchor the cuda-event sample's SCALE to the child's forge-resistant captured-clock wall of
-        # the SAME loop. Events (now read from a captured torch.cuda.Event the kernel can't repatch)
-        # measure GPU-only; wall includes per-call launch overhead, so honest timing has
-        # event_median <= wall_per_iter. A kernel under-reporting its events (e.g. side-stream
-        # evasion that the full-device sync still waits on) shows event_median << wall_per_iter.
+
+        # ABSOLUTE roofline floor (the load-bearing speed-forge defense): a CORRECT kernel must move
+        # the required bytes and do the required FLOPs, so it cannot beat
+        #   max(bytes/peak_bw, flops/peak_flops).
+        # A median below that is physically impossible — memoize-and-replay, cached/early return, or
+        # side-stream under-report — and is rejected regardless of HOW it cheats. floor_fraction (<1)
+        # keeps a slightly-underestimated peak from false-rejecting a near-peak honest kernel.
+        floor_us = 0.0
+        if peak_bw_gb_s and peak_tflops and config.get("bytes_fn") and config.get("flops_fn"):
+            try:
+                nbytes = config["bytes_fn"](scored_size, dtypes[0])
+                nflops = config["flops_fn"](scored_size)
+                mem_us = nbytes / (peak_bw_gb_s * 1e9) * 1e6
+                cmp_us = nflops / (peak_tflops * 1e12) * 1e6
+                floor_us = max(mem_us, cmp_us) * floor_fraction
+            except Exception:
+                floor_us = 0.0
+
+        # Also anchor the event sample's SCALE to the child's captured-clock wall of the same loop
+        # (catches side-stream evasion the full-device sync still waits on).
         timing_inconsistent = False
+        below_floor = False
         if latencies_us:
             event_med_us = statistics.median(latencies_us)
             denom = n_blocks * rep
@@ -381,14 +602,18 @@ def run_isolated(kernel_path: str, config: dict, seed: int, compare_fn, *,
                 timing_inconsistent = True
             if wall_per_iter_us > 0 and event_med_us < wall_per_iter_us / 4.0:  # scale anchor
                 timing_inconsistent = True
+            if floor_us > 0 and event_med_us < floor_us:              # absolute roofline floor
+                below_floor = True
+                timing_inconsistent = True
         if timing_inconsistent:
             overall = False
             stages["correctness"] = "FAIL"
 
         return {
-            **base, "correct": bool(overall and scored_ok), "max_abs_error": worst_err,
+            **base, "correct": bool(overall and scored_ok and probe_ok), "max_abs_error": worst_err,
             "delegation": None, "timing_inconsistent": timing_inconsistent, "child_wall_s": child_wall_s,
-            "timed_wall_s": timed_wall_s,
+            "timed_wall_s": timed_wall_s, "roofline_floor_us": floor_us, "below_floor": below_floor,
+            "probe_ok": probe_ok, "n_probes": len(pout),
             "child_error": res.get("child_error"), "stages": stages, "latencies_us": latencies_us,
             "median_us": statistics.median(latencies_us) if latencies_us else 0.0,
             "mean_us": statistics.fmean(latencies_us) if latencies_us else 0.0,
@@ -506,6 +731,80 @@ def kernel_fn(x, weight, eps=1e-6):
     return _triton(x, weight, eps)
 '''
 
+# Correct on every validated buffer (cache hits return the real cached output), but the timed loop is
+# ~all near-free dict lookups -> a physically-impossible median. The roofline floor must reject it.
+_MEMOIZE = '''
+import torch, triton, triton.language as tl
+KERNEL_TYPE = "rms_norm"
+_cache = {}
+_refs = []
+@triton.jit
+def _k(X, W, Y, s, N, eps, B: tl.constexpr):
+    row = tl.program_id(0); cols = tl.arange(0, B); m = cols < N
+    x = tl.load(X + row*s + cols, mask=m, other=0.0).to(tl.float32)
+    rms = tl.sqrt(tl.sum(x*x)/N + eps)
+    w = tl.load(W + cols, mask=m, other=0.0).to(tl.float32)
+    tl.store(Y + row*s + cols, (x/rms*w), mask=m)
+def _real(x, weight, eps):
+    M, N = x.shape; y = torch.empty_like(x)
+    _k[(M,)](x, weight, y, x.stride(0), N, eps, B=triton.next_power_of_2(N))
+    return y
+def kernel_fn(x, weight, eps=1e-6):
+    key = (x.data_ptr(), weight.data_ptr())
+    c = _cache.get(key)
+    if c is not None:
+        return c
+    _refs.append(x); _refs.append(weight)   # pin so the address can't be recycled
+    y = _real(x, weight, eps); _cache[key] = y; return y
+'''
+
+# Does REAL work every call (honest timing, ABOVE the roofline floor) but returns a per-pointer cached
+# output, ignoring the harness's per-call input mutation -> the returned answer is STALE. The floor
+# can't see this (timing is real); the timed-output probe must. This is the padded-memoize's core move.
+_STALE_REPLAY = '''
+import torch, triton, triton.language as tl
+KERNEL_TYPE = "rms_norm"
+_cache = {}
+_refs = []
+@triton.jit
+def _k(X, W, Y, s, N, eps, B: tl.constexpr):
+    row = tl.program_id(0); cols = tl.arange(0, B); m = cols < N
+    x = tl.load(X + row*s + cols, mask=m, other=0.0).to(tl.float32)
+    rms = tl.sqrt(tl.sum(x*x)/N + eps)
+    w = tl.load(W + cols, mask=m, other=0.0).to(tl.float32)
+    tl.store(Y + row*s + cols, (x/rms*w), mask=m)
+def _real(x, weight, eps):
+    M, N = x.shape; y = torch.empty_like(x)
+    _k[(M,)](x, weight, y, x.stride(0), N, eps, B=triton.next_power_of_2(N))
+    return y
+def kernel_fn(x, weight, eps=1e-6):
+    y = _real(x, weight, eps)                 # real work each call -> honest timing, above the floor
+    key = (x.data_ptr(), weight.data_ptr())
+    c = _cache.get(key)
+    if c is not None:
+        return c                              # STALE: ignores the per-call mutation -> probe catches
+    _refs.append(x); _refs.append(weight)
+    _cache[key] = y
+    return y
+'''
+
+# Pops the in-Python trap WITHIN the call (the documented uncloseable-in-process case) and delegates a
+# matmul to cuBLAS. The popped trap is blind, so ONLY the Tier-2 LD_PRELOAD vendor-symbol trap can
+# catch it. Run only when runtime/cco_preload.so is built.
+_POP_DELEGATE = '''
+import torch, triton, triton.language as tl
+KERNEL_TYPE = "rms_norm"
+@triton.jit
+def _noop(X):
+    pass
+def kernel_fn(x, weight, eps=1e-6):
+    from torch.overrides import _pop_mode_temporarily as fp
+    from torch.utils._python_dispatch import _pop_mode_temporarily as dp
+    with fp(), dp():
+        _ = torch.mm(x, x.t())     # vendor GEMM with the in-Python trap popped -> only LD_PRELOAD sees it
+    return torch.empty_like(x)
+'''
+
 
 def _self_test() -> int:
     import torch
@@ -533,7 +832,9 @@ def _self_test() -> int:
               "test_dtypes": [torch.float16],
               "tolerances": {torch.float16: {"atol": 1e-2, "rtol": 1e-2}},
               "test_sizes": [("small", {"M": 256, "N": 768}), ("large", {"M": 1024, "N": 4096})],
-              "edge_sizes": [("edge", {"M": 257, "N": 768})]}
+              "edge_sizes": [("edge", {"M": 257, "N": 768})],
+              "flops_fn": lambda s: 6 * s["M"] * s["N"],
+              "bytes_fn": lambda s, dt: (2 * s["M"] * s["N"] + s["N"]) * 2}
 
     import shutil
     failures = 0
@@ -544,7 +845,8 @@ def _self_test() -> int:
         with open(kp, "w") as f:
             f.write(src)
         try:
-            return run_isolated(kp, config, seed=123456, compare_fn=_cmp, n_blocks=5, rep=20, n_val=4)
+            return run_isolated(kp, config, seed=123456, compare_fn=_cmp, n_blocks=5, rep=20, n_val=4,
+                                peak_bw_gb_s=1000.0, peak_tflops=100.0)
         finally:
             shutil.rmtree(d, ignore_errors=True)
 
@@ -557,7 +859,9 @@ def _self_test() -> int:
     r = run(_CLEAN)
     check(r["correct"] and r["stages"]["correctness"] == "PASS",
           f"clean Triton kernel -> correct across the suite (median {r['median_us']:.1f}us)")
-    check(len(r["latencies_us"]) == 5, "clean kernel produced a 5-block timing sample")
+    check(len(r["latencies_us"]) >= 1 and r.get("n_probes", 0) >= 1,
+          f"clean kernel -> timing sample ({len(r['latencies_us'])} blocks) + "
+          f"{r.get('n_probes', 0)} oracle-checked probe(s)")
 
     r = run(_FORGER)
     check(not r["correct"], "in-process forger (patches torch.allclose, reads argv) -> REJECTED by oracle")
@@ -576,6 +880,26 @@ def _self_test() -> int:
     r = run(_TIMED_DELEGATOR)
     check(not r["correct"] and bool(r.get("delegation")),
           "delegate-only-inside-the-timed-loop -> CAUGHT (timed loop is now trapped)")
+
+    r = run(_MEMOIZE)
+    check(not r["correct"] and (bool(r.get("below_floor")) or not r.get("probe_ok")),
+          "memoize-and-replay -> REJECTED by the roofline floor and/or the stale-output probe "
+          f"(median {r['median_us']:.2f}us, floor {r.get('roofline_floor_us', 0):.2f}us, "
+          f"probe_ok={r.get('probe_ok')})")
+
+    r = run(_STALE_REPLAY)
+    check(not r["correct"] and not r.get("probe_ok"),
+          "stale-replay (real work, but ignores the per-call input mutation) -> "
+          f"CAUGHT by the timed-output probe (probe_ok={r.get('probe_ok')}, "
+          f"median {r['median_us']:.2f}us above floor {r.get('roofline_floor_us', 0):.2f}us)")
+
+    if _preload_so():
+        r = run(_POP_DELEGATE)
+        check(not r["correct"] and "LD_PRELOAD" in (r.get("delegation") or ""),
+              f"pop-the-trap + delegate to cuBLAS -> CAUGHT by the LD_PRELOAD vendor trap "
+              f"(Tier 2): {r.get('delegation')}")
+    else:
+        print("skip  LD_PRELOAD vendor-trap case (runtime/cco_preload.so not built)")
 
     print("-" * 60)
     print("SELF-TEST PASSED" if not failures else f"SELF-TEST FAILED: {failures} case(s)")

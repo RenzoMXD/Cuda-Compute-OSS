@@ -48,8 +48,13 @@ COPY references ./references
 COPY kernel_configs ./kernel_configs
 COPY champions ./champions
 COPY cco.config.json payload-schema.json pyproject.toml ./
-COPY runtime/gpu.config runtime/start.sh ./runtime/
-RUN chmod +x runtime/start.sh
+COPY runtime/gpu.config runtime/start.sh runtime/cco_preload.c ./runtime/
+# Build the Tier-2 no-delegation LD_PRELOAD trap from its (manifest-pinned) source. Pure libc — no
+# CUDA headers; interposes vendor compute symbols by NAME, so it is cuBLAS-12.x-version-independent.
+# Built in-image (not committed) so the binary matches the image glibc; cco/isolate.py LD_PRELOADs it
+# into the scoring child only, and refuses to score if a plain torch.mm does not trip it (fail-closed).
+RUN chmod +x runtime/start.sh \
+    && gcc -shared -fPIC -O2 -fvisibility=default -o runtime/cco_preload.so runtime/cco_preload.c
 COPY kernel.py ./kernel.py
 
 ENTRYPOINT ["/cco/runtime/start.sh"]

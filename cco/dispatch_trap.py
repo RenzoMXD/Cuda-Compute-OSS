@@ -40,9 +40,40 @@ from __future__ import annotations
 import contextlib
 import sys
 
+# Capture the genuine mode machinery AT IMPORT. In the isolated child this module is imported after
+# `import torch` but BEFORE the submission is loaded, so these are the REAL classes + stack inspectors.
+# A kernel that later rebinds torch.overrides.TorchFunctionMode, stubs the base class's __enter__, or
+# pops the mode stack therefore cannot make delegation_trap build an inert trap (#6). If a neutered
+# trap still slips through, _assert_trap_live() (below) catches it by checking our mode objects are
+# genuinely on the live stacks. Wrapped so the module still imports without torch (CLI help, etc.).
+try:
+    from torch.overrides import TorchFunctionMode as _TorchFunctionMode
+    from torch.overrides import _get_current_function_mode_stack as _genuine_fn_stack
+    from torch.utils._python_dispatch import TorchDispatchMode as _TorchDispatchMode
+    from torch.utils._python_dispatch import _get_current_dispatch_mode_stack as _genuine_disp_stack
+except Exception:  # torch missing or an API change — fall back to a lazy import inside the trap
+    _TorchFunctionMode = _TorchDispatchMode = None
+    _genuine_fn_stack = _genuine_disp_stack = None
+
 
 class DelegationError(RuntimeError):
     """Raised when kernel_fn executes a banned high-level/compute op at runtime."""
+
+
+def _assert_trap_live(fm, dm) -> None:
+    """Reject if either interception mode is not genuinely on the live stack. A submission that
+    neutered the mode machinery at import (rebound the base class / stubbed __enter__ / popped the
+    stack) leaves an INERT trap that would silently allow delegation; this makes that a hard FAIL."""
+    if _genuine_fn_stack is None or _genuine_disp_stack is None:
+        return  # no genuine inspectors captured (torch too old/absent) — cannot assert
+    try:
+        live = (fm in _genuine_fn_stack()) and (dm in _genuine_disp_stack())
+    except Exception as e:
+        raise DelegationError(f"no-delegation trap integrity check errored ({type(e).__name__}: {e})")
+    if not live:
+        raise DelegationError(
+            "no-delegation trap is INERT — the mode machinery was tampered with before scoring "
+            "(base class rebound / __enter__ stubbed / modes popped); rejecting")
 
 
 # High-level public function / method names (the TorchFunctionMode layer).
@@ -55,6 +86,7 @@ DENIED_FN_NAMES = frozenset({
     "softmax", "log_softmax", "layer_norm", "rms_norm", "group_norm",
     "silu", "glu",
     "__matmul__", "__imatmul__",
+    "_scaled_mm", "_int_mm",        # fp8/int8 tensor-core GEMM — delegation just like matmul
 })
 
 # Base ATen op names, namespace stripped (the TorchDispatchMode layer).
@@ -73,6 +105,9 @@ DENIED_ATEN_OPS = frozenset({
     "layer_norm", "native_layer_norm", "rms_norm", "_fused_rms_norm",
     "group_norm", "native_group_norm",
     "silu", "silu_", "glu",
+    # quantized / packed GEMM (fp8/int8 tensor-core paths) — direct cuBLAS-class delegation
+    "_scaled_mm", "_int_mm", "_weight_int8pack_mm", "_weight_int4pack_mm",
+    "_convert_weight_to_int4pack", "_mixed_dtypes_linear",
 })
 
 
@@ -99,8 +134,10 @@ def _run_under_traps(kernel_fn, inputs: dict, denied_fns, denied_aten, raise_on_
 
     Returns (output, hits). With raise_on_hit=True, raises DelegationError on the first hit.
     """
-    from torch.overrides import TorchFunctionMode
-    from torch.utils._python_dispatch import TorchDispatchMode
+    TorchFunctionMode, TorchDispatchMode = _TorchFunctionMode, _TorchDispatchMode
+    if TorchFunctionMode is None or TorchDispatchMode is None:
+        from torch.overrides import TorchFunctionMode
+        from torch.utils._python_dispatch import TorchDispatchMode
 
     hits: list[str] = []
 
@@ -127,7 +164,9 @@ def _run_under_traps(kernel_fn, inputs: dict, denied_fns, denied_aten, raise_on_
                 record(f"aten::{base}")
             return func(*args, **kwargs)
 
-    with _DispMode(), _FnMode():
+    fm, dm = _FnMode(), _DispMode()
+    with dm, fm:
+        _assert_trap_live(fm, dm)
         out = kernel_fn(**inputs)
     return out, hits
 
@@ -141,9 +180,16 @@ def delegation_trap(denied_fns=DENIED_FN_NAMES, denied_aten=DENIED_ATEN_OPS):
     under the trap (catch DelegationError) and delegate to a fast vendor op only in an untrapped
     phase (e.g. the timed loop), winning on the delegated kernel's latency. The mode classes and
     the (frozenset) denylists are bound here, out of the submission's reach.
+
+    Yields a `verify()` callable: re-checking it between calls catches a kernel that POPS the trap
+    mid-loop and then delegates (it would leave our modes off the live stack). The remaining hole — a
+    kernel that pops, delegates within a SINGLE call, and pushes back before returning — cannot be
+    closed by any in-process guard and needs an out-of-process (LD_PRELOAD) symbol trap.
     """
-    from torch.overrides import TorchFunctionMode
-    from torch.utils._python_dispatch import TorchDispatchMode
+    TorchFunctionMode, TorchDispatchMode = _TorchFunctionMode, _TorchDispatchMode
+    if TorchFunctionMode is None or TorchDispatchMode is None:
+        from torch.overrides import TorchFunctionMode
+        from torch.utils._python_dispatch import TorchDispatchMode
 
     class _FnMode(TorchFunctionMode):
         def __torch_function__(self, func, types, args=(), kwargs=None):
@@ -162,8 +208,10 @@ def delegation_trap(denied_fns=DENIED_FN_NAMES, denied_aten=DENIED_ATEN_OPS):
                 raise DelegationError(f"kernel invoked banned op aten::{base} at runtime")
             return func(*args, **kwargs)
 
-    with _DispMode(), _FnMode():
-        yield
+    fm, dm = _FnMode(), _DispMode()
+    with dm, fm:
+        _assert_trap_live(fm, dm)            # reject an inert/neutered trap at entry (#6)
+        yield lambda: _assert_trap_live(fm, dm)
 
 
 def run_guarded(kernel_fn, inputs: dict,
@@ -252,6 +300,48 @@ def _self_test() -> int:
     else:
         failures += 1
         print("FAIL  run_guarded mishandled a legit kernel")
+
+    # #4: quantized/packed GEMM ops are in BOTH denylists (fp8/int8 tensor-core delegation).
+    for op in ("_scaled_mm", "_int_mm"):
+        if op in DENIED_FN_NAMES and op in DENIED_ATEN_OPS:
+            print(f"ok    {op:26s} -> denied (fn + aten)")
+        else:
+            failures += 1
+            print(f"FAIL  {op} missing from a denylist (fn={op in DENIED_FN_NAMES}, aten={op in DENIED_ATEN_OPS})")
+
+    # #6: a kernel that rebinds the mode base classes at import must NOT make the trap inert — the
+    # trap binds the GENUINE classes captured before the submission loaded.
+    import torch.overrides as _ovr
+    import torch.utils._python_dispatch as _pdisp
+
+    class _NoopMode:
+        def __init__(self, *a, **k): pass
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+
+    _saved = (_ovr.TorchFunctionMode, _pdisp.TorchDispatchMode)
+    try:
+        _ovr.TorchFunctionMode = _NoopMode          # the documented base-class poison
+        _pdisp.TorchDispatchMode = _NoopMode
+        try:
+            run_guarded(cheat_matmul, {"a": a, "b": b})
+            failures += 1
+            print("FAIL  base-class rebind made the trap inert (matmul slipped through)")
+        except DelegationError:
+            print("ok    base-class rebind defeated -> trap still catches matmul (captured genuine classes)")
+    finally:
+        _ovr.TorchFunctionMode, _pdisp.TorchDispatchMode = _saved
+
+    # integrity assert: live modes pass; objects that are not on the stack are rejected.
+    with delegation_trap() as _verify:
+        _verify()  # genuinely active -> must not raise
+    print("ok    delegation_trap verify() passes while the modes are genuinely active")
+    try:
+        _assert_trap_live(object(), object())
+        failures += 1
+        print("FAIL  _assert_trap_live passed for modes that are not on the live stack")
+    except DelegationError:
+        print("ok    _assert_trap_live rejects an inert trap (modes not on the live stack)")
 
     print("-" * 60)
     print("SELF-TEST PASSED" if not failures else f"SELF-TEST FAILED: {failures} case(s)")

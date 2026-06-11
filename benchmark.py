@@ -1133,7 +1133,11 @@ def main():
         print("\n=== SCORING (isolated subprocess) ===")
         try:
             from cco.isolate import run_isolated
-            score_sample = run_isolated(kernel_path, config, args.seed, _do_compare, quick=args.quick)
+            _scored_dtype = config["test_dtypes"][0]
+            score_sample = run_isolated(
+                kernel_path, config, args.seed, _do_compare, quick=args.quick,
+                peak_bw_gb_s=gpu.peak_bandwidth_gb_s,
+                peak_tflops=_peak_tflops_for_dtype(gpu, _scored_dtype))
         except Exception as e:
             print(f"score_error: {type(e).__name__}: {e}")
             traceback.print_exc()
@@ -1268,6 +1272,10 @@ def main():
         print(f"score_output_aliased_input: {sc['output_aliased_input']}")
         print(f"score_max_abs_error: {sc['max_abs_error']:.6e}")
         print(f"score_median_us: {sc['median_us']:.4f}")
+        print(f"score_roofline_floor_us: {sc.get('roofline_floor_us', 0.0):.4f}")
+        print(f"score_below_floor: {sc.get('below_floor')}")
+        print(f"score_probe_ok: {sc.get('probe_ok')}")
+        print(f"score_n_probes: {sc.get('n_probes')}")
         print(f"score_mean_us: {sc['mean_us']:.4f}")
         print(f"score_stdev_us: {sc['stdev_us']:.4f}")
         print(f"score_n_blocks: {sc['n_blocks']}")

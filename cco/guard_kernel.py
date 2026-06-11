@@ -60,6 +60,10 @@ DENY_QUALIFIED_NAMES = frozenset({
     # high-level fused ops reachable as torch.<name> (the runtime trap bans these too — keep the
     # static layer aligned so they are rejected at Gate 3, before any GPU spend)
     "torch.rms_norm", "torch.layer_norm", "torch.group_norm", "torch.silu", "torch.glu",
+    # quantized / packed GEMM — fp8/int8 tensor-core matmul is delegation just like torch.matmul
+    "torch._scaled_mm", "torch._int_mm", "torch._weight_int4pack_mm", "torch._weight_int8pack_mm",
+    # JIT-compiling the kernel = delegating kernel generation (Inductor can emit a cuBLAS/CUTLASS GEMM)
+    "torch.compile",
 })
 
 # Whole namespaces that are off-limits (prefix match).
@@ -69,6 +73,13 @@ DENY_QUALIFIED_PREFIXES = (
     "torch._C",                   # private dispatch
     "torch.linalg",               # high-level linear algebra
     "torch.utils.cpp_extension",  # load / load_inline -> inline CUDA-C path (banned in v1)
+    "torch.overrides",            # mode-stack internals (_pop_mode/_push_mode) — popping the runtime trap
+    "torch.utils._python_dispatch",  # _disable_current_modes/_pop_mode — neutering the runtime trap
+    "torch._dynamo",              # compile/codegen — a non-Triton kernel-generation path
+    "torch._inductor",            # the codegen backend itself (cuBLAS/CUTLASS templates)
+    "torch.fx",                   # graph capture -> codegen
+    "torch.jit",                  # TorchScript compile path
+    "torch.classes",              # torch.classes.load_library -> dlopen escape
 )
 
 # Tensor methods that ARE the computation, flagged on any receiver (we usually can't
@@ -83,12 +94,27 @@ DENY_BUILTINS = frozenset({
     "eval", "exec", "compile", "__import__", "getattr", "setattr", "globals", "vars",
 })
 
-# Top-level modules whose import is disallowed in a Triton-only sealed run.
-DENY_IMPORT_MODULES = frozenset({
-    "importlib", "ctypes", "cffi", "subprocess", "pickle", "marshal",
-    "socket", "urllib", "requests", "http", "cupy",
-    "os", "sys", "builtins", "io",  # process/fs/introspection escapes (os.system, sys.argv, ...)
-    "cco",  # a submission must not import the enforcement package (it could reach trap internals)
+# Introspection/traversal dunder ATTRIBUTES that defeat a name-based scan by reaching an arbitrary
+# callable dynamically (e.g. `torch.__dict__['matmul'](a, b)`, `x.__getattribute__('mm')(...)`,
+# `().__class__.__bases__[0].__subclasses__()`). Flagged on ANY access — a legit Triton kernel never
+# touches them (it launches via `kernel[grid](...)`, which is a Subscript on a Name, not these). We do
+# NOT flag Subscript-headed calls in general precisely because `kernel[grid](args)` is the Triton idiom.
+DENY_DUNDER_ATTRS = frozenset({
+    "__dict__", "__getattribute__", "__getattr__", "__globals__", "__builtins__",
+    "__subclasses__", "__bases__", "__mro__", "__base__", "__class__",
+})
+
+# Imports are an ALLOWLIST, not a denylist (a denylist always lags a new GEMM library). A submission
+# may import ONLY these top-level modules: torch + triton are the kernel substrate; the rest are
+# pure-Python utilities a kernel may legitimately need. Everything else is rejected at Gate 3 — both
+# process/fs/introspection escapes (os/sys/ctypes/importlib/subprocess/...) AND every alternate
+# GPU-compute library (cupy/jax/cutlass/cuda-python/numba/pycuda/tensorrt/...) that could perform a
+# matmul outside torch's (interposed) view. Dangerous torch SUBMODULES are independently blocked by
+# DENY_QUALIFIED_PREFIXES above; importing `torch` itself is fine, USING those namespaces is not.
+ALLOW_IMPORT_MODULES = frozenset({
+    "torch", "triton",
+    "math", "cmath", "typing", "__future__", "dataclasses", "functools", "itertools",
+    "collections", "operator", "enum", "numbers", "warnings", "numpy",
 })
 
 # Module-level names the artifact must NOT define (the LOCKED config owns these).
@@ -101,7 +127,8 @@ class Policy:
     deny_qualified_prefixes: tuple = DENY_QUALIFIED_PREFIXES
     deny_methods: frozenset = DENY_METHODS
     deny_builtins: frozenset = DENY_BUILTINS
-    deny_import_modules: frozenset = DENY_IMPORT_MODULES
+    deny_dunder_attrs: frozenset = DENY_DUNDER_ATTRS
+    allow_import_modules: frozenset = ALLOW_IMPORT_MODULES
     forbidden_toplevel_defs: frozenset = FORBIDDEN_TOPLEVEL_DEFS
     require_kernel_fn: bool = True
     require_triton_kernel: bool = True   # Triton-only v1: at least one @triton.jit
@@ -120,7 +147,8 @@ def load_policy_from_config(config_path: str) -> Policy:
         deny_qualified_prefixes=tuple(s["deny_qualified_prefixes"]),
         deny_methods=frozenset(s["deny_methods"]),
         deny_builtins=frozenset(s["deny_builtins"]),
-        deny_import_modules=frozenset(s["deny_import_modules"]),
+        deny_dunder_attrs=frozenset(s.get("deny_dunder_attrs", DENY_DUNDER_ATTRS)),
+        allow_import_modules=frozenset(s["allow_import_modules"]),
         forbidden_toplevel_defs=frozenset(s["forbidden_toplevel_defs"]),
         require_kernel_fn=s.get("require_kernel_fn", True),
         require_triton_kernel=s.get("require_triton_kernel", True),
@@ -259,11 +287,16 @@ class _Scanner(ast.NodeVisitor):
             parts = _dotted_parts(target)
             if not parts:
                 continue
+            qualified = _resolve(parts, self.aliases)
             # Resolve through the import-alias map and require TRITON's jit specifically.
             # A bare suffix match on ".jit" would let any foreign @jit (numba.jit,
             # numba.cuda.jit, ...) satisfy the requires-a-Triton-kernel rule.
-            if _resolve(parts, self.aliases) == "triton.jit":
+            if qualified == "triton.jit":
                 self.found_triton_jit = True
+            # A denied decorator (e.g. bare `@torch.compile`, `@torch._dynamo.optimize(...)`) is
+            # delegation-by-codegen — flag it even though it never appears as a plain Call site.
+            elif _is_denied_qualified(qualified, self.policy):
+                self._add("delegation", f"decorator `@{qualified}` (JIT/codegen delegation)", dec)
 
     def visit_FunctionDef(self, node):
         self._record_def(node)
@@ -320,12 +353,20 @@ class _Scanner(ast.NodeVisitor):
 
         self.generic_visit(node)
 
-    # --- imports ---
+    # --- attribute access: introspection-dunder escapes (reached as `.X` on any receiver) ---
+    def visit_Attribute(self, node):
+        if node.attr in self.policy.deny_dunder_attrs:
+            self._add("dynamic-dispatch",
+                      f"access to `.{node.attr}` (introspection escape that defeats the name scan)", node)
+        self.generic_visit(node)
+
+    # --- imports (ALLOWLIST) ---
     def visit_Import(self, node):
         for a in node.names:
             top = a.name.split(".")[0]
-            if top in self.policy.deny_import_modules:
-                self._add("forbidden-import", f"import of `{a.name}`", node)
+            if top not in self.policy.allow_import_modules:
+                self._add("forbidden-import",
+                          f"import of `{a.name}` (not in the import allowlist)", node)
             if a.name == "torch.utils.cpp_extension" or a.name.startswith("torch.utils.cpp_extension."):
                 self._add("inline-cuda-c", f"import of `{a.name}` (inline CUDA-C is banned in v1)", node)
         self.generic_visit(node)
@@ -333,8 +374,11 @@ class _Scanner(ast.NodeVisitor):
     def visit_ImportFrom(self, node):
         module = node.module or ""
         top = module.split(".")[0]
-        if top in self.policy.deny_import_modules:
-            self._add("forbidden-import", f"import from `{module}`", node)
+        if node.level:  # relative import (`from . import x`) — no top-level module to allowlist; reject
+            self._add("forbidden-import", "relative import is not allowed", node)
+        elif top not in self.policy.allow_import_modules:
+            self._add("forbidden-import",
+                      f"import from `{module}` (not in the import allowlist)", node)
         if module == "torch.utils" and any(a.name == "cpp_extension" for a in node.names):
             self._add("inline-cuda-c", "import of `torch.utils.cpp_extension` (banned in v1)", node)
         if module == "torch.utils.cpp_extension" or module.startswith("torch.utils.cpp_extension"):
@@ -425,6 +469,28 @@ def kernel_fn(x, weight, eps=1e-6):
     return y
 '''
 
+# Allowlisted pure-Python utility imports (math/functools/...) must NOT be flagged.
+_CLEAN_WITH_UTILS = '''
+import math
+from functools import reduce
+import torch
+import triton
+import triton.language as tl
+
+KERNEL_TYPE = "rms_norm"
+
+@triton.jit
+def _copy_kernel(X, Y, N, BLOCK: tl.constexpr):
+    cols = tl.arange(0, BLOCK)
+    tl.store(Y + cols, tl.load(X + cols, mask=cols < N, other=0.0), mask=cols < N)
+
+def kernel_fn(x, weight, eps=1e-6):
+    y = torch.empty_like(x)
+    block = 1 << math.ceil(math.log2(max(1, reduce(lambda a, b: a * b, x.shape, 1))))
+    _copy_kernel[(1,)](x, y, x.numel(), BLOCK=min(block, 1024))
+    return y
+'''
+
 # Each negative case: (label, source, expected_category_substring)
 _NEGATIVE_CASES = [
     ("delegate via F.rms_norm",
@@ -471,6 +537,46 @@ _NEGATIVE_CASES = [
     ("aten ops escape",
      "import torch\ndef kernel_fn(a, b):\n    return torch.ops.aten.mm(a, b)\n",
      "delegation"),
+    ("fp8 GEMM via torch._scaled_mm",
+     "import torch\ndef kernel_fn(a, b, sa, sb):\n    return torch._scaled_mm(a, b, sa, sb)\n",
+     "delegation"),
+    ("pop the runtime trap via torch.overrides",
+     "import torch\ndef kernel_fn(a, b):\n    torch.overrides._pop_mode()\n    return torch.empty_like(a)\n",
+     "delegation"),
+    ("neuter trap via torch.utils._python_dispatch",
+     ("import torch\ndef kernel_fn(a, b):\n"
+      "    torch.utils._python_dispatch._disable_current_modes()\n    return torch.mm(a, b)\n"),
+     "delegation"),
+    ("alternate GPU lib (jax) — not in the import allowlist",
+     "import torch\nimport jax\ndef kernel_fn(a, b):\n    return jax.numpy.matmul(a, b)\n",
+     "forbidden-import"),
+    ("cupy import — not in the allowlist",
+     "import torch\nimport cupy\ndef kernel_fn(a, b):\n    return cupy.matmul(a, b)\n",
+     "forbidden-import"),
+    ("from-import of a non-allowlisted lib",
+     "import torch\nfrom numba import cuda\ndef kernel_fn(a, b):\n    return a\n",
+     "forbidden-import"),
+    ("torch.compile codegen delegation (bare decorator)",
+     "import torch\n@torch.compile\ndef kernel_fn(a, b):\n    return a + b\n",
+     "delegation"),
+    ("torch._dynamo escape",
+     "import torch\ndef kernel_fn(a, b):\n    return torch._dynamo.optimize()(lambda: a @ b)()\n",
+     "delegation"),
+    ("torch._inductor codegen",
+     "import torch\ndef kernel_fn(a, b):\n    return torch._inductor.compile(lambda: a @ b, [])\n",
+     "delegation"),
+    ("packed int4 GEMM via torch._weight_int4pack_mm",
+     "import torch\ndef kernel_fn(a, b, n, s):\n    return torch._weight_int4pack_mm(a, b, n, s)\n",
+     "delegation"),
+    ("dunder-keyed dispatch via torch.__dict__",
+     "import torch\ndef kernel_fn(a, b):\n    return torch.__dict__['matmul'](a, b)\n",
+     "dynamic-dispatch"),
+    ("dunder dispatch via __getattribute__",
+     "import torch\ndef kernel_fn(a, b):\n    return torch.__getattribute__('mm')(a, b)\n",
+     "dynamic-dispatch"),
+    ("class-traversal sandbox escape",
+     "import torch\ndef kernel_fn(a, b):\n    return ().__class__.__bases__[0].__subclasses__()\n",
+     "dynamic-dispatch"),
 ]
 
 
@@ -478,7 +584,8 @@ def _self_test() -> int:
     failures = 0
 
     for label, src in (("clean Triton kernel", _CLEAN_TRITON),
-                       ("clean kernel via `from triton import jit as _jit`", _CLEAN_TRITON_ALIASED_JIT)):
+                       ("clean kernel via `from triton import jit as _jit`", _CLEAN_TRITON_ALIASED_JIT),
+                       ("clean kernel with allowlisted utility imports", _CLEAN_WITH_UTILS)):
         clean = scan_source(src)
         if clean:
             failures += 1

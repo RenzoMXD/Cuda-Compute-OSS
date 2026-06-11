@@ -51,18 +51,28 @@ The competition measures *the kernel you write*, not your ability to call a libr
 Triton-only.** `kernel_fn` (and anything it calls) may **not**:
 
 - call `torch.matmul / mm / bmm / addmm / einsum`, `torch.nn.functional.*` (rms_norm, softmax,
-  silu, scaled_dot_product_attention, …), `torch.ops.aten.*`, or the `@` matmul operator;
-- reach those through aliases, `getattr`, `eval`/`exec`, `importlib`, or tensor methods (`a.mm(b)`);
-- use inline CUDA-C (`torch.utils.cpp_extension`), `ctypes`/`cffi`, or any vendor BLAS/DNN call;
+  silu, scaled_dot_product_attention, …), `torch.ops.aten.*`, `torch._scaled_mm` / `_int_mm` /
+  `_weight_int*pack_mm`, `torch.linalg.*`, or the `@` matmul operator — i.e. any vendor BLAS/DNN call;
+- JIT/codegen the kernel: `torch.compile`, `torch._dynamo` / `torch._inductor` / `torch.fx` / `torch.jit`;
+- reach any of the above through aliases, `getattr` / `eval` / `exec` / `importlib`, introspection
+  dunders (`__dict__` / `__getattribute__` / `__class__` …), or tensor methods (`a.mm(b)`);
+- use inline CUDA-C (`torch.utils.cpp_extension`), or pop/neuter the runtime trap
+  (`torch.overrides`, `torch.utils._python_dispatch`);
 - define `get_inputs`/`get_flops`/`get_bytes`.
+
+**Imports are an allowlist:** only `torch`, `triton`, and a few pure-Python utilities
+(`math` / `typing` / `dataclasses` / `functools` / `numpy` / …). No `os` / `sys` / `ctypes` /
+`subprocess`, and **no alternate GPU-compute library** (`cupy` / `jax` / `cutlass` / `numba` / …).
 
 It **must** contain at least one `@triton.jit` kernel and do the actual compute there. Allowed in the
 Python wrapper: allocation (`torch.empty`/`empty_like`), reshape/view/transpose/contiguous, dtype
 casts, shape introspection, and launching your Triton kernel.
 
-This is enforced **mechanically**, not by review: a static AST guard ([`cco/guard_kernel.py`](cco/guard_kernel.py))
-*and* a runtime trap ([`cco/dispatch_trap.py`](cco/dispatch_trap.py)) reject delegation before and
-during execution. Don't try to wrap cuBLAS — you'll be caught.
+This is enforced **mechanically**, not by review, in three layers: a static AST guard
+([`cco/guard_kernel.py`](cco/guard_kernel.py)) rejects delegation before any GPU spend; a runtime trap
+([`cco/dispatch_trap.py`](cco/dispatch_trap.py)) catches it during execution; and a native
+`LD_PRELOAD` vendor-symbol trap catches any cuBLAS/cuDNN call that slips past the first two — even one
+reached by popping the Python trap. Don't try to wrap cuBLAS — you'll be caught.
 
 ## 4. Self-score locally
 

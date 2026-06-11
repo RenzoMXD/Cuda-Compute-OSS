@@ -109,16 +109,44 @@ side-stream tricks is bounded by a captured-clock wall anchor on the sample's sc
 implausibly faster than the wall are rejected); full timing-forge immunity needs parent-driven
 two-point wall-clock timing, a planned follow-up.
 
+**Timed-loop integrity.** The timed loop runs on a separate buffer set whose input is mutated by one
+element before every call, so a kernel that memoizes by pointer must return a now-stale output and a
+kernel that memoizes by content must recompute (honest timing). A parent-chosen, kernel-unknowable
+sample of timed calls has its `(input, output)` captured and oracle-checked, and an **absolute
+roofline floor** (`max(bytes/peak_bw, flops/peak_flops)`) rejects any physically-impossible median.
+Together these close memoize-and-replay, including the padded variant (cache the answer, burn dummy
+time to clear the floor — the burned-time output is still stale and the probe catches it).
+
+**Native no-delegation backstop (the load-bearing guard).** The in-child dispatch trap is necessary
+but not sufficient: a kernel sharing the interpreter can pop the TorchFunction/TorchDispatch mode
+stack, delegate to a vendor GEMM, and push it back — all within one call, invisible to Python. So the
+scoring child is launched with an **`LD_PRELOAD` shim** (`runtime/cco_preload.c`) that interposes the
+vendor **compute** symbols (cuBLAS/cuBLASLt GEMM, cuDNN convolution/graph-execute, …) by name.
+PyTorch links those libraries into the global symbol scope, so any `torch`→cuBLAS call — even one the
+popped Python trap never saw — resolves to the shim, which records the symbol and `_exit(99)`s the
+child; the parent reports it as delegation. The shim interposes *compute* entry points only (never
+handle/descriptor setup), so a legit Triton kernel (which launches its own MMA via the CUDA driver)
+and torch's own context init never trip it. The parent is **not** preloaded (it computes the cuBLAS
+oracle), and it **refuses to score** unless a plain `torch.mm` child trips the shim — turning any
+future linkage regression into a hard stop, not a silent universal bypass. *Residual:* a vendor
+kernel statically compiled into `libtorch` that crosses no cuBLAS/cuDNN symbol (flash / mem-efficient
+SDPA, row-wise fp8, int4-pack) is shim-blind; those remain guarded only by the static AST ban + the
+(poppable) in-Python trap — hardening them is Tier-3 work.
+
 ## 5. Threat model — what's gameable, and what closes it
 
 | Attack | Closed by | Residual? |
 |---|---|---|
 | Edit the harness / oracle / config / a champion | Gate 2 manifest re-hash (main-authoritative) | no |
 | Inject a new file into a locked dir (auto-import RCE) | Gate 2 full-directory-listing pin | no |
-| Delegate to `torch.matmul` / `F.*` / `@` / cuBLAS | static AST guard (Gate 3) **+** runtime dispatch trap (Gate 4) | hand-rolled MMA vs "morally cuBLAS" is a policy line; Triton-only v1 shrinks it |
+| Delegate to `torch.matmul` / `F.*` / `@` / cuBLAS | static AST guard (Gate 3) **+** runtime dispatch trap (Gate 4) **+** `LD_PRELOAD` vendor-symbol trap | hand-rolled MMA vs "morally cuBLAS" is a policy line; Triton-only v1 shrinks it |
+| Pop the in-Python trap mid-call, then delegate to a vendor GEMM | the `LD_PRELOAD` shim interposes the cuBLAS/cuBLASLt/cuDNN **compute** symbols in the scoring child (op-name-agnostic, unreachable from Python); harness refuses to score if it ever goes inert | fused kernels statically linked into `libtorch` (flash SDPA, row-wise fp8, int4-pack) cross no vendor symbol → guarded only by the static ban (Tier 3) |
+| Delegate via an alternate GPU library (`cupy`/`jax`/`cutlass`/`numba`) or `torch.compile`/Inductor codegen | imports are an **allowlist** (only torch/triton/stdlib-utils) + the codegen namespaces (`torch.compile`/`_dynamo`/`_inductor`/`fx`/`jit`) are banned (Gate 3) | a GEMM that routes through cuBLAS is still caught by the shim; a CUTLASS kernel compiled into `libtorch` is the Tier-3 residual above |
+| Dynamic dispatch to a banned op (aliasing, `getattr`/`eval`, `torch.__dict__['matmul']`) | builtins ban + introspection-dunder ban + import-alias resolution in the static guard | no (any GEMM that does execute still hits the runtime trap + the shim) |
 | Inline CUDA-C escape | banned in v1 (guard rejects `cpp_extension`) | n/a in v1 |
 | Memorize / hardcode outputs for known inputs | PR-HEAD-seeded inputs the kernel **never sees** (process isolation); oracle re-derives truth | no |
 | Cache first answer, return it always | parent-validates distinct buffers before + after timing | no |
+| Memoize-and-replay (per-buffer cache → ~free timed loop) | per-call input mutation + kernel-unknowable timed-output probe + absolute roofline floor (§4) | no |
 | Fast garbage only at the scored size | parent-validates the scored-size outputs against its oracle | no |
 | Win via warm-L2 residency | rotating input buffers across reps | reduced; canonical box also locks clocks |
 | Return a view of the input (no compute) | parent-side oracle validation (an unchanged input fails the oracle) | no |
