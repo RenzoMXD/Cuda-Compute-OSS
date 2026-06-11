@@ -46,6 +46,10 @@
       "deny_builtins": [
         "eval", "exec", "compile", "__import__", "getattr", "setattr", "globals", "vars"
       ],
+      "deny_dunder_attrs": [
+        "__dict__", "__getattribute__", "__getattr__", "__globals__", "__builtins__",
+        "__subclasses__", "__bases__", "__mro__", "__base__", "__class__"
+      ],
       "_import_policy": "ALLOWLIST: a submission may import ONLY these top-level modules; everything else (escapes + alternate GPU-compute libraries that could matmul outside torch's interposed view) is rejected.",
       "allow_import_modules": [
         "torch", "triton",

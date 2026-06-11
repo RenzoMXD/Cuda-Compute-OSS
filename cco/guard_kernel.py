@@ -94,6 +94,16 @@ DENY_BUILTINS = frozenset({
     "eval", "exec", "compile", "__import__", "getattr", "setattr", "globals", "vars",
 })
 
+# Introspection/traversal dunder ATTRIBUTES that defeat a name-based scan by reaching an arbitrary
+# callable dynamically (e.g. `torch.__dict__['matmul'](a, b)`, `x.__getattribute__('mm')(...)`,
+# `().__class__.__bases__[0].__subclasses__()`). Flagged on ANY access — a legit Triton kernel never
+# touches them (it launches via `kernel[grid](...)`, which is a Subscript on a Name, not these). We do
+# NOT flag Subscript-headed calls in general precisely because `kernel[grid](args)` is the Triton idiom.
+DENY_DUNDER_ATTRS = frozenset({
+    "__dict__", "__getattribute__", "__getattr__", "__globals__", "__builtins__",
+    "__subclasses__", "__bases__", "__mro__", "__base__", "__class__",
+})
+
 # Imports are an ALLOWLIST, not a denylist (a denylist always lags a new GEMM library). A submission
 # may import ONLY these top-level modules: torch + triton are the kernel substrate; the rest are
 # pure-Python utilities a kernel may legitimately need. Everything else is rejected at Gate 3 — both
@@ -117,6 +127,7 @@ class Policy:
     deny_qualified_prefixes: tuple = DENY_QUALIFIED_PREFIXES
     deny_methods: frozenset = DENY_METHODS
     deny_builtins: frozenset = DENY_BUILTINS
+    deny_dunder_attrs: frozenset = DENY_DUNDER_ATTRS
     allow_import_modules: frozenset = ALLOW_IMPORT_MODULES
     forbidden_toplevel_defs: frozenset = FORBIDDEN_TOPLEVEL_DEFS
     require_kernel_fn: bool = True
@@ -136,6 +147,7 @@ def load_policy_from_config(config_path: str) -> Policy:
         deny_qualified_prefixes=tuple(s["deny_qualified_prefixes"]),
         deny_methods=frozenset(s["deny_methods"]),
         deny_builtins=frozenset(s["deny_builtins"]),
+        deny_dunder_attrs=frozenset(s.get("deny_dunder_attrs", DENY_DUNDER_ATTRS)),
         allow_import_modules=frozenset(s["allow_import_modules"]),
         forbidden_toplevel_defs=frozenset(s["forbidden_toplevel_defs"]),
         require_kernel_fn=s.get("require_kernel_fn", True),
@@ -339,6 +351,13 @@ class _Scanner(ast.NodeVisitor):
                 self._add("delegation",
                           f"call to delegating method `.{leaf}()` (compute must be in the kernel)", node)
 
+        self.generic_visit(node)
+
+    # --- attribute access: introspection-dunder escapes (reached as `.X` on any receiver) ---
+    def visit_Attribute(self, node):
+        if node.attr in self.policy.deny_dunder_attrs:
+            self._add("dynamic-dispatch",
+                      f"access to `.{node.attr}` (introspection escape that defeats the name scan)", node)
         self.generic_visit(node)
 
     # --- imports (ALLOWLIST) ---
@@ -549,6 +568,15 @@ _NEGATIVE_CASES = [
     ("packed int4 GEMM via torch._weight_int4pack_mm",
      "import torch\ndef kernel_fn(a, b, n, s):\n    return torch._weight_int4pack_mm(a, b, n, s)\n",
      "delegation"),
+    ("dunder-keyed dispatch via torch.__dict__",
+     "import torch\ndef kernel_fn(a, b):\n    return torch.__dict__['matmul'](a, b)\n",
+     "dynamic-dispatch"),
+    ("dunder dispatch via __getattribute__",
+     "import torch\ndef kernel_fn(a, b):\n    return torch.__getattribute__('mm')(a, b)\n",
+     "dynamic-dispatch"),
+    ("class-traversal sandbox escape",
+     "import torch\ndef kernel_fn(a, b):\n    return ().__class__.__bases__[0].__subclasses__()\n",
+     "dynamic-dispatch"),
 ]
 
 

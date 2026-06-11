@@ -175,9 +175,11 @@ def _child_main(job_path: str, out_path: str) -> int:
             # intercepted by the delegation trap (~tens of us of Python per call) and make the CPU, not
             # the kernel, the bottleneck for fast kernels. A Triton launch bypasses the torch dispatcher
             # — the trap never sees it — and the destination views are built once, outside the trap. It
-            # writes a distinct value to element 0 before every timed call, so a content-addressed cache
-            # must recompute (honest timing) and a pointer-addressed cache returns a now-stale (row-0)
-            # output that the parent's probe oracle-checks.
+            # writes a MONOTONICALLY growing value to element 0 before every timed call: the value at a
+            # captured (late) call is therefore far from the value at the buffer's first touch, so a
+            # pointer-cache that replays its first-touch output is stale in row 0 by a wide margin —
+            # detectable at ANY track tolerance — while a content-cache must recompute (honest timing).
+            # Element 0 (vs a rotating index) keeps the store a single un-specialized Triton kernel.
             import triton
             import triton.language as tl
 
@@ -190,8 +192,8 @@ def _child_main(job_path: str, out_path: str) -> int:
                        and tbufs[0][mut_key].is_floating_point())
 
             def mutate(buf_idx, gi):                                # 1 Triton launch, no trapped torch op
-                if _do_mut:
-                    _mut_k[(1,)](_flats[buf_idx], float((gi % 211) + 37))
+                if _do_mut:                                        # 37 + gi: monotonic, bounded < fp16 max
+                    _mut_k[(1,)](_flats[buf_idx], float(37 + gi % 60000))
 
             g = 0                                                   # global timed-call index
             with delegation_trap() as _trap_verify:

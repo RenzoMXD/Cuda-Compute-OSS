@@ -45,6 +45,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <stdlib.h>
+#include <string.h>
 
 /* $CCO_DELEGATION_LOG read ONCE at load (constructor: single-threaded, getenv safe here) so cco_flag
  * — which can fire from inside torch's CUDA dispatch with locks held — uses only async-signal-safe
@@ -56,22 +57,19 @@ static void cco_init(void) {
     g_log_path = getenv("CCO_DELEGATION_LOG");
 }
 
-static unsigned long cco_strlen(const char *s) {
-    unsigned long n = 0;
-    while (s[n]) n++;
-    return n;
-}
-
 static void cco_flag(const char *sym) {
+    /* sym is always a compile-time string literal (#sym from CCO_TRAP), so strlen is bounded. strlen
+     * is a pure memory read (no locks / no malloc) -> safe to call from this async-signal context. */
+    unsigned long n = strlen(sym);
     if (g_log_path) {
         int fd = open(g_log_path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
         if (fd >= 0) {
-            (void)!write(fd, sym, cco_strlen(sym));
+            (void)!write(fd, sym, n);
             (void)!write(fd, "\n", 1);
         }
     }
     (void)!write(2, "CCO_VENDOR_DELEGATION:", 22);   /* best-effort human log (forgeable; not relied on) */
-    (void)!write(2, sym, cco_strlen(sym));
+    (void)!write(2, sym, n);
     (void)!write(2, "\n", 1);
     _exit(99);   /* unforgeable trigger; distinct from segv(139)/abort(134)/oom(137)/python-exc(1) */
 }

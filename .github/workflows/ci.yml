@@ -69,3 +69,25 @@ jobs:
           KT=$(python -c "from cco.guard_kernel import extract_kernel_type; print(extract_kernel_type(open('kernel.py').read()) or '')")
           echo "declared KERNEL_TYPE: ${KT:-<none>}"
           python cco/gate.py kernel.py "$KT" --config cco.config.json
+
+  trap:
+    # The in-Python no-delegation trap (cco/dispatch_trap.py) needs torch but NOT a GPU: its self-test
+    # traps matmul/softmax/_scaled_mm/... on CPU tensors and exercises the base-class-poison defeat +
+    # the live-stack integrity assert. Kept in a SEPARATE job so the `gates` job above stays torch-free
+    # and fast. (The GPU-only checks — isolate.py --self-test and the LD_PRELOAD fail-closed gate —
+    # run on the canonical scoring host, not here.)
+    name: no-delegation trap (CPU torch)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install CPU torch
+        run: pip install --index-url https://download.pytorch.org/whl/cpu torch
+
+      - name: Runtime trap self-test (device-agnostic)
+        run: python cco/dispatch_trap.py --self-test
