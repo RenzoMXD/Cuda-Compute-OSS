@@ -57,29 +57,37 @@ Triton-only.** `kernel_fn` (and anything it calls) may **not**:
 - reach any of the above through aliases, `getattr` / `eval` / `exec` / `importlib`, introspection
   dunders (`__dict__` / `__getattribute__` / `__class__` …), `open` (no file I/O), or tensor methods
   (`a.mm(b)`);
+- reach an attribute or method by passing its name as a **string** — `getattr`, the `operator` module
+  (`operator.attrgetter` / `methodcaller` / `itemgetter`, so `operator` is not importable), or
+  `str.format` / `format_map` field access (`"{0.f_back}".format(x)`). Use f-strings, which expose
+  attribute access as real syntax the guard can see;
 - walk the interpreter stack to read the scorer's state — `__traceback__` / `tb_frame` / `f_back` /
   `f_locals` / `gi_frame` / `__code__` / `__closure__` / `cell_contents` (the timed loop runs your
   kernel in the same interpreter; these are banned so the secret correctness-probe schedule stays secret);
 - create CUDA streams / events / graphs (`torch.cuda.Stream` / `Event` / `CUDAGraph` …) — your Triton
   kernel launches on the current timed stream; moving work off it to under-report timing is rejected;
+- read the CUDA allocator (`torch.cuda.memory_allocated` / `memory_stats` / `mem_get_info` …) — it
+  would leak which calls are correctness-probed (those clone an extra buffer);
 - use inline CUDA-C (`torch.utils.cpp_extension`), or pop/neuter the runtime trap
   (`torch.overrides`, `torch.utils._python_dispatch`);
 - define `get_inputs`/`get_flops`/`get_bytes`.
 
 **Imports are an allowlist:** only `torch`, `triton`, and a few pure-Python utilities
 (`math` / `typing` / `dataclasses` / `functools` / `collections` / …). No `os` / `sys` / `ctypes` /
-`subprocess` / `numpy` (it re-exposes ctypes), and **no alternate GPU-compute library**
-(`cupy` / `jax` / `cutlass` / `numba` / …).
+`subprocess` / `operator` (its `attrgetter`/`methodcaller` are a string-keyed attribute escape) /
+`numpy` (it re-exposes ctypes), and **no alternate GPU-compute library** (`cupy` / `jax` / `cutlass` /
+`numba` / …).
 
 It **must** contain at least one `@triton.jit` kernel and do the actual compute there. Allowed in the
 Python wrapper: allocation (`torch.empty`/`empty_like`), reshape/view/transpose/contiguous, dtype
 casts, shape introspection, and launching your Triton kernel.
 
 This is enforced **mechanically**, not by review, in three layers: a static AST guard
-([`cco/guard_kernel.py`](cco/guard_kernel.py)) rejects delegation before any GPU spend; a runtime trap
-([`cco/dispatch_trap.py`](cco/dispatch_trap.py)) catches it during execution; and a native
-`LD_PRELOAD` vendor-symbol trap catches any cuBLAS/cuDNN call that slips past the first two — even one
-reached by popping the Python trap. Don't try to wrap cuBLAS — you'll be caught.
+([`cco/guard_kernel.py`](cco/guard_kernel.py)) rejects delegation before any GPU spend — and is
+**re-run on the exact bytes about to execute** inside the scoring subprocess, so nothing reaches the GPU
+unscanned; a runtime trap ([`cco/dispatch_trap.py`](cco/dispatch_trap.py)) catches it during execution;
+and a native `LD_PRELOAD` vendor-symbol trap catches any cuBLAS/cuDNN call that slips past the first two
+— even one reached by popping the Python trap. Don't try to wrap cuBLAS — you'll be caught.
 
 ## 4. Self-score locally
 

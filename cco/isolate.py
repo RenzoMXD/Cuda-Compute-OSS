@@ -114,10 +114,26 @@ def _child_main(job_path: str, out_path: str) -> int:
     except OSError:
         pass
 
-    spec = importlib.util.spec_from_file_location("cco_submission_kernel", job["kernel_path"])
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)  # the only place the submission executes; this is the isolated child
-    kernel_fn = mod.kernel_fn
+    delegation = None
+    child_error = None
+
+    # Gate-4 defense-in-depth: the static guard runs at Gate 3, but the SCORED rerun must never exec an
+    # artifact that was not re-scanned — closing both a Gate3->Gate4 TOCTOU window and any path that
+    # reaches scoring without the static gate. Re-scan the exact bytes about to execute (the canonical
+    # denylists are the module defaults, kept equal to cco.config.json by the consistency self-test);
+    # any violation aborts cleanly as a delegation result instead of running unguarded.
+    from cco.guard_kernel import DEFAULT_POLICY, scan_source
+    with open(job["kernel_path"], "r", encoding="utf-8") as _kf:
+        _gate4_violations = scan_source(_kf.read(), DEFAULT_POLICY, filename=job["kernel_path"])
+    if _gate4_violations:
+        v = _gate4_violations[0]
+        delegation = f"static-guard Gate-4 re-scan: {v.category}: {v.message} (line {v.lineno})"
+        kernel_fn = None
+    else:
+        spec = importlib.util.spec_from_file_location("cco_submission_kernel", job["kernel_path"])
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)  # the only place the submission executes; this is the isolated child
+        kernel_fn = mod.kernel_fn
 
     def cuda_in(inp):
         return {k: (v.to("cuda") if hasattr(v, "to") else v) for k, v in inp.items()}
@@ -130,8 +146,6 @@ def _child_main(job_path: str, out_path: str) -> int:
     def clone_in(d):
         return {k: (v.detach().clone() if hasattr(v, "detach") else v) for k, v in d.items()}
 
-    delegation = None
-    child_error = None
     task_outputs = []
     det_outputs = []
     scored_val = []
@@ -960,13 +974,18 @@ def _self_test() -> int:
           "schedule-aware garbage (real only where it predicts a probe) -> CAUGHT by the "
           f"server-random probe schedule (probe_ok={r.get('probe_ok')})")
 
-    if _preload_so():
-        r = run(_POP_DELEGATE)
-        check(not r["correct"] and "LD_PRELOAD" in (r.get("delegation") or ""),
-              f"pop-the-trap + delegate to cuBLAS -> CAUGHT by the LD_PRELOAD vendor trap "
-              f"(Tier 2): {r.get('delegation')}")
-    else:
-        print("skip  LD_PRELOAD vendor-trap case (runtime/cco_preload.so not built)")
+    # Popping the in-Python trap requires torch.overrides / torch.utils._python_dispatch — both
+    # statically banned — so the Gate-4 re-scan rejects this BEFORE any GPU spend (a strengthening over
+    # the prior posture, and host-independent: it no longer needs runtime/cco_preload.so to be caught).
+    # There is no statically-CLEAN way to blind the Python trap, so a popped-trap delegation can never
+    # reach the scoring run; the LD_PRELOAD vendor trap remains the runtime backstop for any statically
+    # -undetectable vendor call (e.g. a libtorch-fused op) and is verified fail-closed every score by
+    # _assert_preload_interposes().
+    r = run(_POP_DELEGATE)
+    _deleg = r.get("delegation") or ""
+    check(not r["correct"] and ("Gate-4 re-scan" in _deleg or "LD_PRELOAD" in _deleg),
+          f"pop-the-trap + delegate to cuBLAS -> REJECTED before run by the Gate-4 static re-scan "
+          f"(LD_PRELOAD backstop verified separately by _assert_preload_interposes): {_deleg}")
 
     print("-" * 60)
     print("SELF-TEST PASSED" if not failures else f"SELF-TEST FAILED: {failures} case(s)")

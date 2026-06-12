@@ -72,6 +72,17 @@ DENY_QUALIFIED_NAMES = frozenset({
     "torch.cuda.set_stream", "torch.cuda.current_stream", "torch.cuda.default_stream",
     "torch.cuda.Event", "torch.cuda.graph", "torch.cuda.CUDAGraph",
     "torch.cuda.make_graphed_callables", "torch.cuda.graph_pool_handle",
+    # CUDA allocator introspection — the correctness probe clones the (input, output) of a server-random
+    # sample of timed calls, allocating extra device memory ONLY on probed calls. A kernel polling its
+    # own allocation across calls could correlate that step-up with "this call is probed" and do real
+    # work only there. A Triton kernel never needs to read allocator stats; ban the readout.
+    "torch.cuda.memory_allocated", "torch.cuda.max_memory_allocated",
+    "torch.cuda.memory_reserved", "torch.cuda.max_memory_reserved",
+    "torch.cuda.memory_cached", "torch.cuda.max_memory_cached",
+    "torch.cuda.memory_stats", "torch.cuda.memory_stats_as_nested_dict",
+    "torch.cuda.memory_snapshot", "torch.cuda.memory_summary", "torch.cuda.mem_get_info",
+    "torch.cuda.reset_peak_memory_stats", "torch.cuda.reset_accumulated_memory_stats",
+    "torch.cuda.reset_max_memory_allocated", "torch.cuda.reset_max_memory_cached",
 })
 
 # Whole namespaces that are off-limits (prefix match).
@@ -89,20 +100,40 @@ DENY_QUALIFIED_PREFIXES = (
     "torch.jit",                  # TorchScript compile path
     "torch.classes",              # torch.classes.load_library -> dlopen escape
     "torch.cuda.graphs",          # CUDA graph capture -> replay can distort the timed window
+    "torch.cuda.memory",          # torch.cuda.memory.* allocator-stats submodule (probe side channel)
 )
 
-# Tensor methods that ARE the computation, flagged on any receiver (we usually can't
-# prove the receiver is a Tensor, so default-reject these names).
+# Method names that are always rejected, flagged on any receiver (we usually can't prove the receiver
+# type, so default-reject the name). Two groups:
+#   (1) tensor methods that ARE the computation (delegation);
+#   (2) STRING-KEYED attribute/format access — the load-bearing closure of the frame-walk class. A
+#       denylist of attribute NAMES (DENY_DUNDER_ATTRS) only sees names that appear literally as an
+#       `ast.Attribute.attr`; it is defeated by any call that takes the attribute path as a STRING:
+#         operator.attrgetter("__traceback__.tb_frame.f_back.f_locals")(e)   # operator (also import-banned)
+#         operator.methodcaller("__getattribute__", "f_back")(x)
+#         "{0.__traceback__.tb_frame.f_back.f_locals}".format(e)             # str.format field access
+#       getattr is already a banned builtin; these are the remaining name-as-string routes. f-strings are
+#       the supported alternative to .format and DO expose attribute access as real AST nodes (caught).
 DENY_METHODS = frozenset({
+    # (1) delegation
     "matmul", "mm", "bmm", "addmm", "baddbmm", "addbmm", "einsum", "tensordot",
     "softmax", "log_softmax", "scaled_dot_product_attention",
+    # (2) string-keyed attribute / format dispatch
+    "attrgetter", "methodcaller", "itemgetter", "format", "format_map",
 })
+
+# The subset of DENY_METHODS that is string-keyed dispatch (presentation only — drives a clearer
+# violation message; the gate itself is DENY_METHODS membership above).
+_STRING_DISPATCH_METHODS = frozenset({"attrgetter", "methodcaller", "itemgetter", "format", "format_map"})
 
 # Builtins that enable dynamic dispatch / code execution (denylist-escape vectors), plus `open`
 # (a Triton kernel never needs file I/O; banning it stops a kernel from reading the scoring job —
 # the secret probe schedule — or any other host file).
 DENY_BUILTINS = frozenset({
     "eval", "exec", "compile", "__import__", "getattr", "setattr", "globals", "vars", "open",
+    # string-keyed attribute/method dispatch (the `operator` module is itself import-banned below; these
+    # also catch the bare `from operator import attrgetter` -> `attrgetter(...)` call form for good measure)
+    "attrgetter", "methodcaller", "itemgetter",
 })
 
 # Introspection ATTRIBUTES that defeat a name-based scan by reaching state the kernel must not touch.
@@ -141,8 +172,12 @@ DENY_DUNDER_ATTRS = frozenset({
 ALLOW_IMPORT_MODULES = frozenset({
     "torch", "triton",
     "math", "cmath", "typing", "__future__", "dataclasses", "functools", "itertools",
-    "collections", "operator", "enum", "numbers", "warnings",
+    "collections", "enum", "numbers", "warnings",
 })
+# NOTE: `operator` is deliberately NOT allowlisted. operator.attrgetter / methodcaller / itemgetter take
+# the attribute/method name as a STRING, which bypasses the literal-name DENY_DUNDER_ATTRS scan and
+# re-opens the stack-frame walk (reading the secret probe schedule) — the same class of escape as the
+# banned `getattr`. A Triton kernel never needs it; arithmetic/comparison operators are language syntax.
 
 # Module-level names the artifact must NOT define (the LOCKED config owns these).
 FORBIDDEN_TOPLEVEL_DEFS = frozenset({"get_inputs", "get_flops", "get_bytes"})
@@ -375,8 +410,13 @@ class _Scanner(ast.NodeVisitor):
                     self._add("delegation", f"call to forbidden `{qualified}()`", node)
                     leaf = None  # already reported on this node
             if leaf in self.policy.deny_methods:
-                self._add("delegation",
-                          f"call to delegating method `.{leaf}()` (compute must be in the kernel)", node)
+                if leaf in _STRING_DISPATCH_METHODS:
+                    self._add("dynamic-dispatch",
+                              f"call to `.{leaf}()` (string-keyed attribute/format access — defeats the "
+                              f"name scan; use an f-string and explicit attribute access instead)", node)
+                else:
+                    self._add("delegation",
+                              f"call to delegating method `.{leaf}()` (compute must be in the kernel)", node)
 
         self.generic_visit(node)
 
@@ -634,6 +674,28 @@ _NEGATIVE_CASES = [
      "delegation"),
     ("CUDA-graph capture to distort the timed window",
      "import torch\ndef kernel_fn(a, b):\n    g = torch.cuda.CUDAGraph()\n    return a + b\n",
+     "delegation"),
+    ("string-keyed frame walk via operator.attrgetter (bypasses the literal-name attr ban)",
+     ("import torch\nimport operator\ndef kernel_fn(a, b):\n"
+      "    try:\n        raise RuntimeError()\n"
+      "    except RuntimeError as e:\n"
+      "        loc = operator.attrgetter('__traceback__.tb_frame.f_back.f_back.f_locals')(e)\n"
+      "    return loc['probe_set']\n"),
+     "forbidden-import"),
+    ("string-keyed dispatch via operator.methodcaller even if operator were importable",
+     ("import torch\nfrom operator import methodcaller\ndef kernel_fn(a, b):\n"
+      "    return methodcaller('__getattribute__', 'f_back')(b)\n"),
+     "forbidden-import"),
+    ("frame walk via str.format field access (attr names live in the format string, not the AST)",
+     ("import torch\ndef kernel_fn(a, b):\n"
+      "    try:\n        raise RuntimeError()\n"
+      "    except RuntimeError as e:\n"
+      "        s = '{0.__traceback__.tb_frame.f_back.f_back.f_locals}'.format(e)\n"
+      "    return s\n"),
+     "dynamic-dispatch"),
+    ("probe-correlated allocator side channel via torch.cuda.memory_allocated",
+     ("import torch\ndef kernel_fn(a, b):\n    m = torch.cuda.memory_allocated()\n"
+      "    return a + b if m else a\n"),
      "delegation"),
 ]
 

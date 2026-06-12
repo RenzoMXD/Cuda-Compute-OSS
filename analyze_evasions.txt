@@ -1,0 +1,117 @@
+CRITICAL FINDINGS: CCO Guard Evasions
+
+Based on reading guard_kernel.py's _Scanner class (lines 290-414), here are the key vulnerabilities:
+
+1. OPERATOR.ATTRGETTER/METHODCALLER/ITEMGETTER EVASION (CRITICAL)
+   - Problem: operator is in ALLOW_IMPORT_MODULES (line 144)
+   - The scanner's visit_Call (lines 355-381) checks:
+     a) If func is ast.Name -> check if in deny_builtins (eval/exec/getattr/setattr etc)
+     b) If func is ast.Attribute -> check if the LEAF attribute name (func.attr) is in deny_methods
+   - operator.attrgetter("__traceback__") is a Call where func is ast.Attribute
+   - The scanner checks if "attrgetter" is in deny_methods (line 377) - IT IS NOT
+   - The STRING argument "__traceback__" is never examined - only the literal attribute name is checked
+   - Result: operator.attrgetter/methodcaller/itemgetter can construct runtime access to banned attributes
+   
+   Attack code:
+   ```
+   import operator
+   getter = operator.attrgetter("__traceback__")  # PASSES: attrgetter not in deny_methods
+   setter = operator.methodcaller("__getattribute__", "__closure__")  # PASSES
+   # Later: getter(exception_obj) reads the traceback
+   ```
+
+2. FROM-IMPORT ALIAS RESOLUTION BUG for torch.cuda.Stream (HIGH)
+   - Problem: _build_alias_map (lines 245-266) handles from-imports
+   - Line 265: aliases[bound] = f"{module}.{a.name}" if module else a.name
+   - For "from torch.cuda import Stream", module="torch.cuda", a.name="Stream"
+   - Resulting alias: "torch.cuda.Stream" ✓ CORRECT
+   - However, when this is later called as Stream() (ast.Name "Stream"):
+   - visit_Call line 358: isinstance(func, ast.Name) 
+   - Line 363: qualified = _resolve([func.id], self.aliases)
+   - _resolve (line 269-274): looks up parts[0]="Stream" in aliases -> "torch.cuda.Stream"
+   - Then line 364: _is_denied_qualified("torch.cuda.Stream", policy)
+   - CHECK: Is "torch.cuda.Stream" in policy.deny_qualified_names? YES (line 71)
+   - So this SHOULD be caught... but let me check the self-test for confirmation
+   
+   Actually, reviewing lines 522-637, I don't see a self-test case for "from torch.cuda import Stream"
+   The test at line 631-634 shows a direct torch.cuda.Stream() call, but NOT the from-import variant
+   
+   Attack code:
+   ```
+   from torch.cuda import Stream
+   s = Stream()  # Might evade if alias resolution has a bug
+   # Risk: MEDIUM - likely caught but worth testing
+
+3. COMPREHENSION/LAMBDA/NESTED FUNCTION SCOPE BUG (HIGH)
+   - Problem: The scanner uses ast.NodeVisitor which traverses the ENTIRE tree with generic_visit
+   - Line 328-330: visit_FunctionDef calls _record_def THEN generic_visit(node)
+   - This SHOULD recursively visit all child nodes including nested functions, lambdas, comprehensions
+   - HOWEVER: there is NO special handling for Lambda, ListComp, DictComp, SetComp, GeneratorExp, etc.
+   - These nodes' bodies ARE visited by generic_visit, so attributes in them SHOULD be flagged
+   
+   Let me check if there's a scoping issue:
+   - ast.walk() traverses ALL nodes in any order
+   - ast.NodeVisitor.generic_visit() recursively visits child nodes in order
+   - For a Lambda, the body is an ast.Expr containing the Lambda node
+   - The Lambda node's body attribute contains the expression
+   - visit_Attribute will be called on attribute nodes in the lambda body
+   
+   Result: This is LIKELY NOT an evasion - comprehensions/lambdas/nested defs SHOULD be caught
+   But the ABSENCE of explicit visit_Lambda/visit_ListComp methods is suspicious
+
+4. ATTRIBUTE ON CALL RESULT EVASION (MEDIUM)
+   - Problem: Subscript[expression].__attr access
+   - Code: x = [RuntimeError()][0].__traceback__
+   - AST structure: Attribute(value=Subscript(...), attr="__traceback__")
+   - The visit_Attribute (lines 384-388) checks if node.attr in deny_dunder_attrs
+   - This WILL catch the __traceback__ access
+   - Result: NOT an evasion
+
+5. WALRUS OPERATOR IN IF CONDITION (MEDIUM)
+   - Code: if (exc := RuntimeError()): x = exc.__traceback__
+   - AST structure: If(test=NamedExpr(...), body=[...])
+   - The NamedExpr is visited by generic_visit
+   - The Attribute node for __traceback__ is also visited
+   - Result: NOT an evasion - the attribute access itself is visited
+
+6. DEFAULT ARGUMENT WITH FORBIDDEN EXPRESSION (MEDIUM)
+   - Code: def kernel_fn(a, b, exc=RuntimeError(), tb=None):
+   - Then: tb = exc.__traceback__
+   - Default args ARE visited as part of the function definition
+   - The assignment tb = exc.__traceback__ is an Assign node, visited by visit_Assign -> generic_visit
+   - The attribute access in the assignment IS visited by visit_Attribute
+   - Result: NOT an evasion
+
+7. TORCH.CUDA STREAM/GRAPH BAN COMPLETENESS (MEDIUM)
+   - Line 71-74: torch.cuda.Stream, ExternalStream, stream, StreamContext, set_stream, 
+                 current_stream, default_stream, Event, graph, CUDAGraph, make_graphed_callables
+   - These are all in deny_qualified_names
+   - torch.cuda.graphs (line 91) is in deny_qualified_prefixes
+   - Result: Stream operations should be caught... but need to verify the alias map works correctly
+
+SUMMARY OF REAL GAPS:
+
+CRITICAL EVASION #1: operator.attrgetter(name_string) / operator.methodcaller(name_string)
+- These are methods (lines 347-349 in operator module)
+- Call: operator.attrgetter("__traceback__") is ast.Call(func=ast.Attribute(attr="attrgetter"))
+- Scanner checks if "attrgetter" in deny_methods - it's NOT
+- The string argument "__traceback__" is NEVER inspected
+- This allows runtime construction of attribute access to ANY banned attribute
+- FIX: Ban operator module methods that take string attribute names:
+  - Add "attrgetter", "methodcaller", "itemgetter" to DENY_METHODS
+  - OR check the string arguments to these specific calls
+
+CRITICAL EVASION #2: String literals in Constant nodes
+- Code: operator.attrgetter("__traceback__") or getattr(obj, "__code__")
+- The actual method names being accessed are in ast.Constant(value="__traceback__")
+- The scanner NEVER examines Constant nodes for forbidden strings
+- A determined attacker could construct dispatch strings
+- HOWEVER: getattr is already in DENY_BUILTINS, so getattr(obj, "__code__") is caught
+- operator.attrgetter is the main hole
+
+OTHER CONCERNS:
+- The alias map might miss some import patterns (relative imports explicitly skipped at line 262)
+- No explicit visit_Lambda, visit_ListComp etc means ANY custom scoping rules are bypassed
+  (but generic_visit should still catch the attributes inside them)
+
+TYPING HINT EVASION #15: Not a real attack vector - annotations are not executed
