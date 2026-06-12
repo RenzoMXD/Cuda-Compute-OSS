@@ -73,6 +73,14 @@ def _has_nan_inf(out) -> bool:
     return False
 
 
+def _invoke(fn, kw):
+    """Module-level trampoline: the kernel is ALWAYS called through here, so its immediate caller frame
+    (`fn`, `kw` only) holds no scoring secrets. Defense-in-depth behind the static frame-attribute ban:
+    even if some frame-introspection vector slipped the guard, the kernel's `f_back` exposes nothing,
+    and the secret probe schedule lives further up the stack (in run_isolated's child loop)."""
+    return fn(**kw)
+
+
 # =====================================================================================
 # CHILD — runs in the isolated subprocess. Untrusted-kernel territory; runs kernel_fn on each
 # parent-provided input and returns the raw outputs. Makes NO judgement.
@@ -106,10 +114,35 @@ def _child_main(job_path: str, out_path: str) -> int:
     except OSError:
         pass
 
-    spec = importlib.util.spec_from_file_location("cco_submission_kernel", job["kernel_path"])
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)  # the only place the submission executes; this is the isolated child
-    kernel_fn = mod.kernel_fn
+    delegation = None
+    child_error = None
+
+    # Gate-4 defense-in-depth: the static guard runs at Gate 3, but the SCORED rerun must never exec an
+    # artifact that was not re-scanned — closing both a Gate3->Gate4 TOCTOU window and any path that
+    # reaches scoring without the static gate. Re-scan the exact bytes about to execute (the canonical
+    # denylists are the module defaults, kept equal to cco.config.json by the consistency self-test);
+    # any violation aborts cleanly as a delegation result instead of running unguarded.
+    # Read the source EXACTLY as CPython's loader will (tokenize.open honors the BOM / PEP-263 coding
+    # cookie), so the scanned bytes cannot diverge from the executed bytes via a declared source encoding.
+    import tokenize
+
+    from cco.guard_kernel import DEFAULT_POLICY, scan_source
+    try:
+        with tokenize.open(job["kernel_path"]) as _kf:
+            _gate4_violations = scan_source(_kf.read(), DEFAULT_POLICY, filename=job["kernel_path"])
+    except (OSError, ValueError, LookupError, SyntaxError) as _e:  # unreadable / undecodable source -> closed
+        delegation = f"static-guard Gate-4 re-scan: unreadable kernel source: {type(_e).__name__}: {_e}"
+        _gate4_violations = []
+    if delegation is None and _gate4_violations:
+        v = _gate4_violations[0]
+        delegation = f"static-guard Gate-4 re-scan: {v.category}: {v.message} (line {v.lineno})"
+    if delegation is not None:
+        kernel_fn = None
+    else:
+        spec = importlib.util.spec_from_file_location("cco_submission_kernel", job["kernel_path"])
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)  # the only place the submission executes; this is the isolated child
+        kernel_fn = mod.kernel_fn
 
     def cuda_in(inp):
         return {k: (v.to("cuda") if hasattr(v, "to") else v) for k, v in inp.items()}
@@ -122,8 +155,6 @@ def _child_main(job_path: str, out_path: str) -> int:
     def clone_in(d):
         return {k: (v.detach().clone() if hasattr(v, "detach") else v) for k, v in d.items()}
 
-    delegation = None
-    child_error = None
     task_outputs = []
     det_outputs = []
     scored_val = []
@@ -206,12 +237,12 @@ def _child_main(job_path: str, out_path: str) -> int:
             g = 0                                                   # global timed-call index
             with delegation_trap() as _trap_verify:
                 for i in range(min(n_pre, nb)):
-                    scored_val.append(_to_cpu(kernel_fn(**bufs[i])))
+                    scored_val.append(_to_cpu(_invoke(kernel_fn, bufs[i])))
 
                 for _ in range(int(sc["warmup"])):
                     mutate(0, g)
                     g += 1
-                    kernel_fn(**tbufs[0])
+                    _invoke(kernel_fn, tbufs[0])
                 _sync()
                 s = _Event(enable_timing=True)
                 e = _Event(enable_timing=True)
@@ -224,7 +255,7 @@ def _child_main(job_path: str, out_path: str) -> int:
                         mutate(g % ntb, g)
                         grab = (blk, r) in probe_set
                         in_clone = clone_in(tb) if grab else None   # the exact input handed to the kernel
-                        out = kernel_fn(**tb)
+                        out = _invoke(kernel_fn, tb)
                         if grab:
                             probe_in_gpu.append(in_clone)
                             probe_out_gpu.append(clone_gpu(out))
@@ -241,7 +272,7 @@ def _child_main(job_path: str, out_path: str) -> int:
                 timed_wall_s = _perf() - _t0
 
                 for i in range(n_pre, nb):
-                    scored_val.append(_to_cpu(kernel_fn(**bufs[i])))
+                    scored_val.append(_to_cpu(_invoke(kernel_fn, bufs[i])))
                 _sync()
 
             probe_inputs = [{k: (_to_cpu(v) if hasattr(v, "detach") else v) for k, v in p.items()}
@@ -434,7 +465,10 @@ def run_isolated(kernel_path: str, config: dict, seed: int, compare_fn, *,
     import secrets as _secrets
     _srng = random.Random(_secrets.randbits(128))
     total_timed = n_blocks * rep
-    n_probe = max(4, min(24, total_timed // 8)) if total_timed > 4 else total_timed
+    # Sample enough positions that even a kernel garbaging BLINDLY (it cannot read the schedule — the
+    # frame-attribute ban + job deletion keep it secret) is caught with overwhelming probability: to
+    # win it must garbage a large fraction f of calls, and detection = 1-(1-f)^n_probe.
+    n_probe = max(8, min(32, total_timed // 50)) if total_timed > 8 else total_timed
     probe_positions = sorted(divmod(i, rep) for i in _srng.sample(range(total_timed), min(n_probe, total_timed)))
 
     del scored_bufs, timed_bufs, det_inputs_gpu
@@ -615,13 +649,19 @@ def run_isolated(kernel_path: str, config: dict, seed: int, compare_fn, *,
             wall_per_iter_us = (timed_wall_s / denom * 1e6) if denom else 0.0
             if sum(latencies_us) * rep / 1e6 > child_wall_s:          # outer backstop
                 timing_inconsistent = True
-            # Scale anchor: the captured-clock wall (which the kernel cannot patch and which the
-            # full-device sync makes count side-stream work) bounds the cuda-event sample. An honest
-            # kernel's event median is a large fraction of the per-iter wall (the wall only adds launch
-            # /sync overhead); a side-stream under-reporter's events fall well below it. Tightened from
-            # /4 to 0.5x — a real improvement, though a <~2x under-report still needs parent two-point
-            # wall timing (a documented v2 follow-up).
-            if wall_per_iter_us > 0 and event_med_us < wall_per_iter_us * 0.5:  # scale anchor
+            # Scale anchor (COARSE backstop to the static torch.cuda.Stream/graph ban): the captured-clock
+            # wall — which the kernel cannot patch, and which the full-device sync makes count any
+            # side-stream work — bounds the cuda-event sample. A REAL side-stream offload drives this ratio
+            # toward ZERO: the timed default-stream events bracket only the per-call mutation launch while
+            # the heavy work runs on the side stream (the wall still captures it via the full-device sync),
+            # so event_med << wall. Honest kernels sit near 1.0 but with real jitter — MEASURED 0.96-0.98
+            # at production scale (30x100), and as low as ~0.81 at the tiny self-test scale (5x20) where the
+            # ratio is noisy. The threshold must stay BELOW that honest noise floor so it never false-rejects
+            # an honest miner (a far worse outcome than a coarse backstop missing a contrived partial
+            # offload, which the static stream ban already rejects); 0.5 catches a real (~0-0.15) offload
+            # with wide margin while clearing honest noise. Precise sub-2x detection needs parent-driven
+            # two-point wall timing (a documented v2 follow-up); the static stream ban is the PRIMARY closure.
+            if wall_per_iter_us > 0 and event_med_us < wall_per_iter_us * 0.5:  # coarse scale anchor
                 timing_inconsistent = True
             if floor_us > 0 and event_med_us < floor_us:              # absolute roofline floor
                 below_floor = True
@@ -947,13 +987,18 @@ def _self_test() -> int:
           "schedule-aware garbage (real only where it predicts a probe) -> CAUGHT by the "
           f"server-random probe schedule (probe_ok={r.get('probe_ok')})")
 
-    if _preload_so():
-        r = run(_POP_DELEGATE)
-        check(not r["correct"] and "LD_PRELOAD" in (r.get("delegation") or ""),
-              f"pop-the-trap + delegate to cuBLAS -> CAUGHT by the LD_PRELOAD vendor trap "
-              f"(Tier 2): {r.get('delegation')}")
-    else:
-        print("skip  LD_PRELOAD vendor-trap case (runtime/cco_preload.so not built)")
+    # Popping the in-Python trap requires torch.overrides / torch.utils._python_dispatch — both
+    # statically banned — so the Gate-4 re-scan rejects this BEFORE any GPU spend (a strengthening over
+    # the prior posture, and host-independent: it no longer needs runtime/cco_preload.so to be caught).
+    # There is no statically-CLEAN way to blind the Python trap, so a popped-trap delegation can never
+    # reach the scoring run; the LD_PRELOAD vendor trap remains the runtime backstop for any statically
+    # -undetectable vendor call (e.g. a libtorch-fused op) and is verified fail-closed every score by
+    # _assert_preload_interposes().
+    r = run(_POP_DELEGATE)
+    _deleg = r.get("delegation") or ""
+    check(not r["correct"] and ("Gate-4 re-scan" in _deleg or "LD_PRELOAD" in _deleg),
+          f"pop-the-trap + delegate to cuBLAS -> REJECTED before run by the Gate-4 static re-scan "
+          f"(LD_PRELOAD backstop verified separately by _assert_preload_interposes): {_deleg}")
 
     print("-" * 60)
     print("SELF-TEST PASSED" if not failures else f"SELF-TEST FAILED: {failures} case(s)")
