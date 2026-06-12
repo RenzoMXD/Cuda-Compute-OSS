@@ -73,14 +73,6 @@ def _has_nan_inf(out) -> bool:
     return False
 
 
-def _invoke(fn, kw):
-    """Module-level trampoline: the kernel is ALWAYS called through here, so its immediate caller frame
-    (`fn`, `kw` only) holds no scoring secrets. Defense-in-depth behind the static frame-attribute ban:
-    even if some frame-introspection vector slipped the guard, the kernel's `f_back` exposes nothing,
-    and the secret probe schedule lives further up the stack (in run_isolated's child loop)."""
-    return fn(**kw)
-
-
 # =====================================================================================
 # CHILD — runs in the isolated subprocess. Untrusted-kernel territory; runs kernel_fn on each
 # parent-provided input and returns the raw outputs. Makes NO judgement.
@@ -103,7 +95,7 @@ def _child_main(job_path: str, out_path: str) -> int:
     _Event = torch.cuda.Event
     _sync = torch.cuda.synchronize
     _perf = time.perf_counter
-    from cco.dispatch_trap import DelegationError, delegation_trap, run_guarded
+    from cco.dispatch_trap import DelegationError, delegation_trap
 
     # The job (incl. the secret probe schedule) is now fully in memory — DELETE the file before the
     # submission loads so a kernel cannot read which timed calls are oracle-checked (`open` is also
@@ -136,13 +128,78 @@ def _child_main(job_path: str, out_path: str) -> int:
     if delegation is None and _gate4_violations:
         v = _gate4_violations[0]
         delegation = f"static-guard Gate-4 re-scan: {v.category}: {v.message} (line {v.lineno})"
-    if delegation is not None:
-        kernel_fn = None
-    else:
-        spec = importlib.util.spec_from_file_location("cco_submission_kernel", job["kernel_path"])
+    # ===============================================================================================
+    # WORKER THREAD — the ONLY place the submission's code runs: BOTH its module-level code (exec_module)
+    # AND every kernel_fn call. The secret probe schedule, the timing events, the captured clock, and
+    # `job` itself all live in THIS (main) thread's frames. `f_back` walks only the CURRENT thread's
+    # stack, and the cross-thread frame-access escapes (sys._current_frames / gc / threading) are all
+    # import-banned — so NO attribute-by-name trick (match/case, operator, str.format, getattr, or a
+    # form not yet invented) can reach the schedule from the worker. This closes the frame-walk class
+    # STRUCTURALLY, not by enumerating syntactic forms. The dispatch trap is thread-local, so it runs in
+    # the worker (run_guarded re-enters it per call).
+    # ===============================================================================================
+    import queue as _queue
+    import threading
+
+    _kpath = job["kernel_path"]
+    _req: "_queue.Queue" = _queue.Queue()
+    _resp: "_queue.Queue" = _queue.Queue()
+
+    def _worker():
+        spec = importlib.util.spec_from_file_location("cco_submission_kernel", _kpath)
         mod = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(mod)  # the only place the submission executes; this is the isolated child
-        kernel_fn = mod.kernel_fn
+        try:
+            spec.loader.exec_module(mod)          # top-level submission code runs on the WORKER stack
+            kfn = mod.kernel_fn
+        except BaseException as ex:               # noqa: BLE001 — any import failure -> report to parent
+            _resp.put(("load", ex))
+            return
+        _resp.put(("load", None))
+        try:
+            with delegation_trap() as _tv:        # persistent trap (thread-local to the worker)
+                while True:
+                    cmd, arg = _req.get()
+                    if cmd == "stop":
+                        return
+                    if cmd == "verify":
+                        try:
+                            _tv()
+                            _resp.put(("ok", None))
+                        except BaseException as ex:    # noqa: BLE001
+                            _resp.put(("err", ex))
+                        continue
+                    try:
+                        _resp.put(("ok", kfn(**arg)))
+                    except BaseException as ex:    # noqa: BLE001 — DelegationError / crash -> main thread
+                        _resp.put(("err", ex))
+        except BaseException as ex:                # noqa: BLE001 — trap entry failed
+            _resp.put(("err", ex))
+
+    def _call(buf):
+        _req.put(("run", buf))
+        tag, val = _resp.get()
+        if tag == "err":
+            raise val
+        return val
+
+    def _verify():                                # re-assert the worker's trap is still live
+        _req.put(("verify", None))
+        tag, val = _resp.get()
+        if tag == "err":
+            raise val
+
+    _wt = None
+    if delegation is None:
+        _wt = threading.Thread(target=_worker, daemon=True)
+        _wt.start()
+        _ltag, _lerr = _resp.get()                # block until the submission has loaded in the worker
+        if _lerr is not None:
+            if isinstance(_lerr, DelegationError):
+                delegation = str(_lerr)
+            else:
+                child_error = f"load: {type(_lerr).__name__}: {_lerr}"
+            _wt.join(timeout=5)
+            _wt = None
 
     def cuda_in(inp):
         return {k: (v.to("cuda") if hasattr(v, "to") else v) for k, v in inp.items()}
@@ -160,6 +217,7 @@ def _child_main(job_path: str, out_path: str) -> int:
     scored_val = []
     event_block_us: list[float] = []
     timed_wall_s = 0.0
+    two_point_us = 0.0
     probe_in_gpu: list = []   # captured (input, output) of a parent-chosen, kernel-unknowable sample
     probe_out_gpu: list = []  # of TIMED calls; the parent oracle-checks them (defeats a stale cache)
     probe_inputs: list = []   # ^ the same, moved to CPU for the parent after the timed window
@@ -168,25 +226,25 @@ def _child_main(job_path: str, out_path: str) -> int:
     try:
         # --- correctness tasks (smoke / sweep / stability / edge): run once each ---
         for t in job["tasks"]:
-            if delegation:
+            if delegation or _wt is None:
                 task_outputs.append({"output": None, "error": "skipped"})
                 continue
             try:
-                out = run_guarded(kernel_fn, cuda_in(t["inputs"]))
+                out = _call(cuda_in(t["inputs"]))
                 task_outputs.append({"output": _to_cpu(out), "error": None})
             except DelegationError as e:
                 delegation = str(e)
                 task_outputs.append({"output": None, "error": "delegation"})
-            except Exception as e:  # OOM / crash on a locked size is a per-task failure
+            except Exception as e:  # noqa: BLE001 — OOM / crash on a locked size is a per-task failure
                 task_outputs.append({"output": None, "error": f"{type(e).__name__}: {e}"})
             torch.cuda.empty_cache()
 
         # --- determinism: run the same input N times ---
-        if delegation is None and job.get("determinism"):
+        if delegation is None and _wt is not None and job.get("determinism"):
             d = job["determinism"]
             di = cuda_in(d["inputs"])
             for _ in range(int(d["runs"])):
-                det_outputs.append(_to_cpu(run_guarded(kernel_fn, di)))
+                det_outputs.append(_to_cpu(_call(di)))
             torch.cuda.empty_cache()
 
         # --- scored size: EVERY call (pre-val / warmup / timed / post-val) runs under the trap, so
@@ -198,7 +256,7 @@ def _child_main(job_path: str, out_path: str) -> int:
         #     output. To catch the latter, a parent-chosen, kernel-UNKNOWABLE sample of timed calls
         #     has its (mutated input, output) captured for the parent to oracle-check. Pre/post-val
         #     use the CLEAN buffers (never mutated), so the correct-then-garbage check is unaffected. ---
-        if delegation is None:
+        if delegation is None and _wt is not None:
             sc = job["scored"]
             bufs = [cuda_in(b) for b in sc["buffers"]]              # clean: pre/post validation only
             nb = len(bufs)
@@ -235,56 +293,92 @@ def _child_main(job_path: str, out_path: str) -> int:
                     _mut_k[(1,)](_flats[buf_idx], float(37 + gi % 60000))
 
             g = 0                                                   # global timed-call index
-            with delegation_trap() as _trap_verify:
-                for i in range(min(n_pre, nb)):
-                    scored_val.append(_to_cpu(_invoke(kernel_fn, bufs[i])))
+            # The submission runs in the WORKER thread (via _call); the trap rides with it there
+            # (run_guarded re-enters it per call). The events s/e, the clock _perf, and probe_set all
+            # stay in THIS thread — off the kernel's reachable call stack.
+            for i in range(min(n_pre, nb)):
+                scored_val.append(_to_cpu(_call(bufs[i])))
 
-                for _ in range(int(sc["warmup"])):
-                    mutate(0, g)
+            for _ in range(int(sc["warmup"])):
+                mutate(0, g)
+                g += 1
+                _call(tbufs[0])
+            _sync()
+            s = _Event(enable_timing=True)
+            e = _Event(enable_timing=True)
+            _t0 = _perf()
+            for blk in range(n_blk):
+                _verify()                          # between blocks: catch a kernel that popped the trap
+                s.record()
+                for r in range(rep):
+                    bi = g % ntb
+                    tb = tbufs[bi]
+                    mutate(bi, g)
+                    grab = (blk, r) in probe_set
+                    in_clone = clone_in(tb) if grab else None       # the exact input handed to the kernel
+                    out = _call(tb)
+                    if grab:
+                        probe_in_gpu.append(in_clone)
+                        probe_out_gpu.append(clone_gpu(out))
                     g += 1
-                    _invoke(kernel_fn, tbufs[0])
+                e.record()
                 _sync()
-                s = _Event(enable_timing=True)
-                e = _Event(enable_timing=True)
-                _t0 = _perf()
-                for blk in range(n_blk):
-                    _trap_verify()         # between blocks: catch a kernel that popped the trap mid-loop
-                    s.record()
-                    for r in range(rep):
-                        tb = tbufs[g % ntb]
-                        mutate(g % ntb, g)
-                        grab = (blk, r) in probe_set
-                        in_clone = clone_in(tb) if grab else None   # the exact input handed to the kernel
-                        out = _invoke(kernel_fn, tb)
-                        if grab:
-                            probe_in_gpu.append(in_clone)
-                            probe_out_gpu.append(clone_gpu(out))
-                        g += 1
-                    e.record()
-                    _sync()
-                    # EVERY block feeds the median (probe positions are scattered across all blocks and
-                    # unknowable to the kernel), so a kernel cannot garbage a median-feeding call without
-                    # risking the oracle probe. The few async clones at probe positions are negligible.
-                    event_block_us.append(s.elapsed_time(e) * 1000.0 / rep)
-                # Captured-clock wall of the whole timed window: forge-resistant (the kernel cannot
-                # patch _perf or _sync here), so the parent anchors the cuda-event sample's scale to
-                # it — a kernel under-reporting events (e.g. side-stream evasion) is caught.
-                timed_wall_s = _perf() - _t0
+                # EVERY block feeds the median (probe positions are scattered across all blocks and
+                # unknowable to the kernel), so a kernel cannot garbage a median-feeding call without
+                # risking the oracle probe. The few async clones at probe positions are negligible.
+                event_block_us.append(s.elapsed_time(e) * 1000.0 / rep)
+            timed_wall_s = _perf() - _t0
 
-                for i in range(n_pre, nb):
-                    scored_val.append(_to_cpu(_invoke(kernel_fn, bufs[i])))
-                _sync()
+            # --- TWO-POINT WALL TIMING: a forge-resistant, side-stream-PROOF per-call GPU cost. Time M
+            #     calls done ONCE each (wall1) vs M calls done TWICE each (wall2), every call on a FRESHLY
+            #     mutated buffer so a content-cache cannot satisfy the 2nd. The captured clock + full
+            #     -device sync count ANY side-stream work the cuda events miss; the (wall2 - wall1)
+            #     difference cancels the per-iteration host/handoff overhead, leaving the real per-call
+            #     cost. The parent rejects an event median implausibly below this — a timing under-report
+            #     (e.g. a side stream) — WITHOUT enumerating stream-API names. _perf is in THIS thread, so
+            #     the worker-thread kernel cannot patch it. ---
+            _m2 = max(20, min(200, (n_blk * rep) // 10))
+            _sync()
+            _w0 = _perf()
+            for _ in range(_m2):
+                bi = g % ntb
+                mutate(bi, g)
+                _call(tbufs[bi])
+                g += 1
+            _sync()
+            _wall1 = _perf() - _w0
+            _w0 = _perf()
+            for _ in range(_m2):
+                bi = g % ntb
+                mutate(bi, g)
+                _call(tbufs[bi])
+                g += 1
+                bi = g % ntb
+                mutate(bi, g)
+                _call(tbufs[bi])
+                g += 1
+            _sync()
+            _wall2 = _perf() - _w0
+            two_point_us = max(0.0, (_wall2 - _wall1) / _m2 * 1e6)
+
+            for i in range(n_pre, nb):
+                scored_val.append(_to_cpu(_call(bufs[i])))
+            _sync()
 
             probe_inputs = [{k: (_to_cpu(v) if hasattr(v, "detach") else v) for k, v in p.items()}
                             for p in probe_in_gpu]
             probe_outputs = [_to_cpu(p) for p in probe_out_gpu]
     except DelegationError as ex:
         delegation = str(ex)
-    except Exception as ex:
+    except Exception as ex:  # noqa: BLE001
         # A crash (wrong signature, OOM, runtime error) in determinism/scored is a graceful FAIL,
         # not a child crash: leave the (incomplete) outputs and let the parent mark the missing
         # stages FAIL rather than losing the whole verdict.
         child_error = f"{type(ex).__name__}: {ex}"
+    finally:
+        if _wt is not None:                       # tear down the kernel worker thread
+            _req.put(("stop", None))
+            _wt.join(timeout=5)
 
     if delegation is not None:
         det_outputs, scored_val, event_block_us = [], [], []
@@ -292,7 +386,7 @@ def _child_main(job_path: str, out_path: str) -> int:
 
     torch.save({"task_outputs": task_outputs, "det_outputs": det_outputs,
                 "scored_val": scored_val, "event_block_us": event_block_us,
-                "timed_wall_s": timed_wall_s, "delegation": delegation,
+                "timed_wall_s": timed_wall_s, "two_point_us": two_point_us, "delegation": delegation,
                 "probe_inputs": probe_inputs, "probe_outputs": probe_outputs,
                 "child_error": child_error}, out_path)
     return 0
@@ -647,21 +741,24 @@ def run_isolated(kernel_path: str, config: dict, seed: int, compare_fn, *,
             event_med_us = statistics.median(latencies_us)
             denom = n_blocks * rep
             wall_per_iter_us = (timed_wall_s / denom * 1e6) if denom else 0.0
-            if sum(latencies_us) * rep / 1e6 > child_wall_s:          # outer backstop
+            two_point_us = float(res.get("two_point_us") or 0.0)
+            if sum(latencies_us) * rep / 1e6 > child_wall_s:          # outer backstop (claimed GPU > wall)
                 timing_inconsistent = True
-            # Scale anchor (COARSE backstop to the static torch.cuda.Stream/graph ban): the captured-clock
-            # wall — which the kernel cannot patch, and which the full-device sync makes count any
-            # side-stream work — bounds the cuda-event sample. A REAL side-stream offload drives this ratio
-            # toward ZERO: the timed default-stream events bracket only the per-call mutation launch while
-            # the heavy work runs on the side stream (the wall still captures it via the full-device sync),
-            # so event_med << wall. Honest kernels sit near 1.0 but with real jitter — MEASURED 0.96-0.98
-            # at production scale (30x100), and as low as ~0.81 at the tiny self-test scale (5x20) where the
-            # ratio is noisy. The threshold must stay BELOW that honest noise floor so it never false-rejects
-            # an honest miner (a far worse outcome than a coarse backstop missing a contrived partial
-            # offload, which the static stream ban already rejects); 0.5 catches a real (~0-0.15) offload
-            # with wide margin while clearing honest noise. Precise sub-2x detection needs parent-driven
-            # two-point wall timing (a documented v2 follow-up); the static stream ban is the PRIMARY closure.
-            if wall_per_iter_us > 0 and event_med_us < wall_per_iter_us * 0.5:  # coarse scale anchor
+            # TWO-POINT WALL ANCHOR — the durable, name-independent side-stream defense. The child's
+            # two-point figure (wall of 2x kernel calls minus wall of 1x, captured-clock + full-device
+            # synced) is the REAL per-call GPU cost INCLUDING any work moved to a side stream that the
+            # default-stream cuda events miss. So an event median far below it is a timing under-report
+            # (side stream under ANY qualified name, or patched events) — caught WITHOUT enumerating the
+            # stream API. Because the kernel runs in a worker thread it cannot reach _perf, the events, or
+            # the schedule, so both numbers are honest. The two-point also carries the per-call mutation +
+            # thread-handoff overhead, so the honest event/two-point ratio is < 1 (MEASURED ~0.7-0.95);
+            # the 0.5 threshold stays below that honest floor so it never false-rejects a real kernel,
+            # while a side-stream offload drives the ratio toward 0. (wall_per_iter is the fallback when a
+            # two-point sample is unavailable.)
+            if two_point_us > 0:
+                if event_med_us < two_point_us * 0.5:
+                    timing_inconsistent = True
+            elif wall_per_iter_us > 0 and event_med_us < wall_per_iter_us * 0.5:
                 timing_inconsistent = True
             if floor_us > 0 and event_med_us < floor_us:              # absolute roofline floor
                 below_floor = True
@@ -673,7 +770,8 @@ def run_isolated(kernel_path: str, config: dict, seed: int, compare_fn, *,
         return {
             **base, "correct": bool(overall and scored_ok and probe_ok), "max_abs_error": worst_err,
             "delegation": None, "timing_inconsistent": timing_inconsistent, "child_wall_s": child_wall_s,
-            "timed_wall_s": timed_wall_s, "roofline_floor_us": floor_us, "below_floor": below_floor,
+            "timed_wall_s": timed_wall_s, "two_point_us": float(res.get("two_point_us") or 0.0),
+            "roofline_floor_us": floor_us, "below_floor": below_floor,
             "probe_ok": probe_ok, "n_probes": len(pout),
             "child_error": res.get("child_error"), "stages": stages, "latencies_us": latencies_us,
             "median_us": statistics.median(latencies_us) if latencies_us else 0.0,
