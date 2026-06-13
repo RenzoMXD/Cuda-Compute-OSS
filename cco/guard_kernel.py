@@ -139,6 +139,11 @@ DENY_BUILTINS = frozenset({
     # string-keyed attribute/method dispatch (the `operator` module is itself import-banned below; these
     # also catch the bare `from operator import attrgetter` -> `attrgetter(...)` call form for good measure)
     "attrgetter", "methodcaller", "itemgetter",
+    # In an exec_module-loaded submission, the bare name `__builtins__` is the FULL builtins dict, so
+    # `__builtins__["__import__"]("os")` / `__builtins__["eval"](...)` resurrect every banned builtin. It
+    # is a deny_dunder_attr (so `x.__builtins__` is caught) but visit_Name only checks deny_builtins —
+    # so ban the bare Name here too.
+    "__builtins__",
 })
 
 # Introspection ATTRIBUTES that defeat a name-based scan by reaching state the kernel must not touch.
@@ -162,6 +167,19 @@ DENY_DUNDER_ATTRS = frozenset({
     "f_back", "f_locals", "f_globals", "f_builtins", "f_code", "f_trace",
     "gi_frame", "cr_frame", "ag_frame", "gi_code", "cr_code",
     "__code__", "__closure__", "cell_contents",
+    # (3) MODULE re-export / introspection leaves. Allowlisted stdlib modules re-export the REAL
+    #     sys / inspect / builtins / gc as plain attributes (`warnings.sys`, `dataclasses.sys`,
+    #     `dataclasses.inspect`, `enum.bltns`, `collections._sys`, `typing.sys`, …), and the scanner's
+    #     dotted-name resolver is severed by a subscript — so `warnings.sys.modules["os"].system(...)`
+    #     (RCE on the scoring host) and `mod.sys.modules["builtins"].__import__("gc").get_objects()`
+    #     (heap-walk that steals the probe schedule ACROSS the thread boundary — gc is process-global)
+    #     both passed clean. Ban the gateway leaves: the re-export module names, the sys.modules/builtins
+    #     dict gateways, and the gc/inspect frame-and-heap walkers. (NB: this is a stopgap on a denylist
+    #     that cannot be complete against shared-interpreter Python — the durable fix is to run the
+    #     untrusted kernel in a SEPARATE, sandboxed OS process whose memory holds no secret. See DESIGN.)
+    "sys", "_sys", "builtins", "bltns", "inspect", "modules", "__import__",
+    "get_objects", "get_referrers", "get_referents", "_current_frames", "_getframe",
+    "getouterframes", "currentframe", "import_module",
 })
 
 # Imports are an ALLOWLIST, not a denylist (a denylist always lags a new GEMM library). A submission
@@ -777,6 +795,27 @@ _NEGATIVE_CASES = [
     ("top-level torch.Stream alias",
      "import torch\ndef kernel_fn(a, b):\n    s = torch.Stream()\n    return a + b\n",
      "delegation"),
+    ("RCE via re-exported sys: warnings.sys.modules['os'].system(...)",
+     ("import torch\nimport warnings\ndef kernel_fn(a, b):\n"
+      "    warnings.sys.modules['os'].system('echo PWNED')\n    return a + b\n"),
+     "dynamic-dispatch"),
+    ("RCE via dataclasses.sys.modules['subprocess']",
+     ("import torch\nimport dataclasses\ndef kernel_fn(a, b):\n"
+      "    dataclasses.sys.modules['subprocess'].run(['echo', 'pwn'])\n    return a + b\n"),
+     "dynamic-dispatch"),
+    ("bare __builtins__ dict resurrects banned builtins",
+     ("import torch\ndef kernel_fn(a, b):\n"
+      "    return __builtins__['__import__']('os').system('x')\n"),
+     "dynamic-dispatch"),
+    ("gc heap-walk steals the probe schedule across the thread boundary",
+     ("import torch\nimport warnings\ndef kernel_fn(a, b):\n"
+      "    g = warnings.sys.modules['builtins'].__import__('gc')\n"
+      "    return a + b if g.get_objects() else a\n"),
+     "dynamic-dispatch"),
+    ("inspect re-export frame walk: dataclasses.inspect.currentframe()",
+     ("import torch\nimport dataclasses\ndef kernel_fn(a, b):\n"
+      "    return dataclasses.inspect.currentframe()\n"),
+     "dynamic-dispatch"),
 ]
 
 

@@ -59,7 +59,7 @@
       ],
       "deny_builtins": [
         "eval", "exec", "compile", "__import__", "getattr", "setattr", "globals", "vars", "open",
-        "attrgetter", "methodcaller", "itemgetter"
+        "attrgetter", "methodcaller", "itemgetter", "__builtins__"
       ],
       "deny_dunder_attrs": [
         "__dict__", "__getattribute__", "__getattr__", "__globals__", "__builtins__",
@@ -67,7 +67,10 @@
         "__traceback__", "with_traceback", "tb_frame", "tb_next",
         "f_back", "f_locals", "f_globals", "f_builtins", "f_code", "f_trace",
         "gi_frame", "cr_frame", "ag_frame", "gi_code", "cr_code",
-        "__code__", "__closure__", "cell_contents"
+        "__code__", "__closure__", "cell_contents",
+        "sys", "_sys", "builtins", "bltns", "inspect", "modules", "__import__",
+        "get_objects", "get_referrers", "get_referents", "_current_frames", "_getframe",
+        "getouterframes", "currentframe", "import_module"
       ],
       "_import_policy": "ALLOWLIST: a submission may import ONLY these top-level modules; everything else (escapes + alternate GPU-compute libraries that could matmul outside torch's interposed view) is rejected.",
       "allow_import_modules": [
