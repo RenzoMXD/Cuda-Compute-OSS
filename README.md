@@ -1,6 +1,7 @@
 
-# CCO — Compute-Cost Optimization
-<img width="1104" height="517" alt="CCO-adver" src="https://github.com/user-attachments/assets/83dec1d6-cbf2-424b-8c9d-ed16ba024bfa" />
+# Cuda-Compute-OSS
+<img width="1104" height="517" alt="CCO-adver" src="https://github.com/user-attachments/assets/c34608c5-2370-4d86-a05c-6f01a93d9f5f" />
+
 
 
 
