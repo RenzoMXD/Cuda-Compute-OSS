@@ -2,7 +2,7 @@
 name: Strategy proposal
 about: Propose a new smart strategy / transform to lower matrix-multiply cost
 title: "[strategy] "
-labels: strategy
+labels: "type:strategy, status:triage"
 ---
 
 ## Idea
