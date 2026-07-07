@@ -34,8 +34,9 @@ from .github_client import GitHubClient, PRInfo
 REPO_DEFAULT = "zeokin/Cuda-Compute-OSS"
 BLOCKED_CONTRIBUTORS_PATH = ".github/blocked-contributors.txt"
 IDEMPOTENCY_MARKER = "<!-- cco-eval:{sha} -->"
+NEEDS_SCORECARD_MARKER = "<!-- cco-needs-scorecard:{sha} -->"
 GPU_QUEUE_LABEL = "status:queued-gpu"
-GPU_QUEUE_READY_ACTIONS = frozenset({"eval_pending", "already_evaluated"})
+GPU_QUEUE_READY_ACTIONS = frozenset({"eval_pending"})
 PROTECTED_PATH_LABEL = "status:protected-path"
 PROTECTED_PATH_PREFIXES = ("eval/", "docs/", ".github/", "dashboard/")
 PROTECTED_PATH_EXACT = frozenset()
@@ -47,7 +48,7 @@ PROTECTED_PATH_EXACT = frozenset()
 # Phase 2's real runner is the actual authority on whether a PR improved
 # anything -- this is only a courtesy pre-filter.
 SCORECARD_RE = re.compile(
-    r"accuracy\s*\|?\s*[0-9]|latency\s*\|?\s*[0-9]|RESULT_JSON", re.IGNORECASE
+    r"accuracy[^\n]*[0-9]|latency[^\n]*[0-9]|RESULT_JSON", re.IGNORECASE
 )
 
 
@@ -73,6 +74,11 @@ def load_blocked_contributors(path: str = BLOCKED_CONTRIBUTORS_PATH) -> frozense
 def already_evaluated(comments: list, head_sha: str) -> bool:
     marker = IDEMPOTENCY_MARKER.format(sha=head_sha)
     return any(marker in c for c in comments)
+
+
+def already_notified(comments: list, marker: str, head_sha: str) -> bool:
+    tagged = marker.format(sha=head_sha)
+    return any(tagged in c for c in comments)
 
 
 def has_scorecard(body: str) -> bool:
@@ -166,7 +172,7 @@ def process_pr(
     return GateOutcome(pr.number, "evaluated", detail=json.dumps(result))
 
 
-def _apply(client: GitHubClient, pr: PRInfo, outcome: GateOutcome) -> None:
+def _apply(client: GitHubClient, pr: PRInfo, outcome: GateOutcome, comments: list) -> None:
     """Perform the write action implied by ``outcome``. Only called from
     :func:`run_once` when ``dry_run=False`` -- not the default in Phase 1."""
     if outcome.action == "close_blocked":
@@ -180,9 +186,14 @@ def _apply(client: GitHubClient, pr: PRInfo, outcome: GateOutcome) -> None:
         client.post_comment(pr.number, f"Flagged for maintainer review: {outcome.detail}")
     elif outcome.action == "needs_scorecard":
         client.add_label(pr.number, "status:needs-scorecard")
-        client.post_comment(pr.number,
-                            "Please add a filled-in scorecard from "
-                            "`python -m eval` (see CONTRIBUTING.md).")
+        client.remove_label(pr.number, GPU_QUEUE_LABEL)
+        if not already_notified(comments, NEEDS_SCORECARD_MARKER, pr.head_sha):
+            client.post_comment(
+                pr.number,
+                NEEDS_SCORECARD_MARKER.format(sha=pr.head_sha)
+                + "\nPlease add a filled-in scorecard from "
+                  "`python -m eval` (see CONTRIBUTING.md).",
+            )
     elif outcome.action == "protected_path":
         client.add_label(pr.number, PROTECTED_PATH_LABEL)
         client.post_comment(
@@ -192,6 +203,7 @@ def _apply(client: GitHubClient, pr: PRInfo, outcome: GateOutcome) -> None:
             "changes stay outside protected paths.",
         )
     elif outcome.action == "eval_pending":
+        client.remove_label(pr.number, "status:needs-scorecard")
         client.add_label(pr.number, GPU_QUEUE_LABEL)
         client.post_comment(
             pr.number,
@@ -199,7 +211,10 @@ def _apply(client: GitHubClient, pr: PRInfo, outcome: GateOutcome) -> None:
             + "\nGate chain passed. This PR is queued for the next batched "
               "GPU evaluation window.",
         )
-    # skip_draft / already_evaluated / evaluated: nothing to write here.
+    elif outcome.action == "already_evaluated":
+        client.remove_label(pr.number, "status:needs-scorecard")
+        client.remove_label(pr.number, GPU_QUEUE_LABEL)
+    # skip_draft / evaluated: nothing to write here.
     # ("evaluated" posts its own scorecard comment from within run_eval /
     # eval.runner once Phase 2 wires that in -- not this function's job.)
 
@@ -300,7 +315,7 @@ def run_once(
         outcomes.append(outcome)
 
         if not dry_run:
-            _apply(client, pr, outcome)
+            _apply(client, pr, outcome, comments)
 
     if dashboard_data:
         write_queue_dashboard(dashboard_data, build_queue_dashboard(open_prs, outcomes))

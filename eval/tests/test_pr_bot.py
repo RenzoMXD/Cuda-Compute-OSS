@@ -15,9 +15,11 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspa
 from eval import copycat_guard
 from eval.pr_bot import (
     GPU_QUEUE_LABEL,
+    NEEDS_SCORECARD_MARKER,
     PROTECTED_PATH_LABEL,
     PRInfo,
     already_evaluated,
+    already_notified,
     build_queue_dashboard,
     changed_files,
     has_scorecard,
@@ -135,6 +137,8 @@ def test_clean_pr_with_runner_is_evaluated():
 def test_has_scorecard_matches_labeler_ymls_detector():
     assert has_scorecard(SCORECARD_BODY)
     assert has_scorecard("here is my RESULT_JSON {...}")
+    assert has_scorecard("| latency | exact 632.06 ms |")
+    assert has_scorecard("| accuracy | 1.0 (reference) |")
     assert not has_scorecard(NO_SCORECARD_BODY)
     assert not has_scorecard("")
     assert not has_scorecard(None)
@@ -143,6 +147,11 @@ def test_has_scorecard_matches_labeler_ymls_detector():
 def test_already_evaluated_helper():
     assert already_evaluated(["hello", "<!-- cco-eval:abc -->", "world"], "abc")
     assert not already_evaluated(["hello", "world"], "abc")
+
+
+def test_already_notified_helper():
+    assert already_notified(["x", "<!-- cco-needs-scorecard:abc -->"], NEEDS_SCORECARD_MARKER, "abc")
+    assert not already_notified(["x"], NEEDS_SCORECARD_MARKER, "abc")
 
 
 class FakeClient:
@@ -170,6 +179,9 @@ class FakeClient:
 
     def add_label(self, pr_number, label):
         self.actions.append(("add_label", pr_number, label))
+
+    def remove_label(self, pr_number, label):
+        self.actions.append(("remove_label", pr_number, label))
 
     def close_pr(self, pr_number, reason):
         self.actions.append(("close_pr", pr_number, reason))
@@ -202,6 +214,20 @@ def test_run_once_live_mode_applies_actions():
     assert any(a[0] == "post_comment" for a in client.actions)
 
 
+def test_run_once_live_mode_does_not_repeat_needs_scorecard_comment():
+    pr1 = _pr(number=1, author="alice", body=NO_SCORECARD_BODY)
+    marker = NEEDS_SCORECARD_MARKER.format(sha="sha1")
+    client = FakeClient(
+        prs={"all": [pr1], "open": [pr1]},
+        diffs={1: SOME_DIFF},
+        comments={1: [marker]},
+    )
+    outcomes = run_once(client, dry_run=False)
+    assert outcomes[0].action == "needs_scorecard"
+    assert ("add_label", 1, "status:needs-scorecard") in client.actions
+    assert not any(a[0] == "post_comment" for a in client.actions)
+
+
 def test_run_once_live_mode_labels_gpu_queue():
     pr1 = _pr(number=1, author="alice", body=SCORECARD_BODY)
     client = FakeClient(prs={"all": [pr1], "open": [pr1]}, diffs={1: SOME_DIFF})
@@ -210,6 +236,30 @@ def test_run_once_live_mode_labels_gpu_queue():
     assert ("add_label", 1, GPU_QUEUE_LABEL) in client.actions
     assert any("next batched GPU evaluation" in a[2] for a in client.actions
                if a[0] == "post_comment")
+    assert ("remove_label", 1, "status:needs-scorecard") in client.actions
+
+
+def test_run_once_live_mode_clears_queue_label_once_already_evaluated():
+    pr1 = _pr(number=1, author="alice", head_sha="sha1", body=SCORECARD_BODY)
+    client = FakeClient(
+        prs={"all": [pr1], "open": [pr1]},
+        diffs={1: SOME_DIFF},
+        comments={1: ["<!-- cco-eval:sha1 -->"]},
+    )
+    outcomes = run_once(client, dry_run=False)
+    assert outcomes[0].action == "already_evaluated"
+    assert ("remove_label", 1, GPU_QUEUE_LABEL) in client.actions
+
+
+def test_queue_dashboard_only_lists_eval_pending_prs():
+    pr1 = _pr(number=1, author="alice", body=SCORECARD_BODY)
+    pr2 = _pr(number=2, author="bob", body=SCORECARD_BODY)
+    outcomes = [
+        process_pr(pr1, SOME_DIFF, ["<!-- cco-eval:sha1 -->"], frozenset(), []),
+        process_pr(pr2, SOME_DIFF, [], frozenset(), []),
+    ]
+    data = build_queue_dashboard([pr1, pr2], outcomes)
+    assert [row["pr"] for row in data["queue"]] == [2]
 
 
 def test_run_once_live_mode_labels_protected_path():
