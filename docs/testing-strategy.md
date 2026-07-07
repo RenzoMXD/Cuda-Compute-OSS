@@ -34,14 +34,13 @@ needs inventing at the algorithm level, only hardening:
 
 ## Pinned hardware — RTX 5090
 
-Chosen over A100 for consumer-tier accessibility (matches the "runs on every
-GPU" narrative and sparkinfer's own target hardware). Known risk: RTX 5090
-cloud spot availability was inconsistent as of mid-2026 (limited providers,
-prices swinging $0.50–2.00/hr). Mitigation: don't rely on ad-hoc spot rental
-for the validator box — either reserve a dedicated instance with a provider
-confirmed to stock 5090s, or run a self-hosted physical 5090 as the GitHub
-Actions runner so PR validation never blocks on spot inventory. A100 80GB
-remains the fallback/secondary reference if 5090 supply becomes unworkable.
+Chosen for consumer-tier accessibility (matches the "runs on every GPU"
+narrative and sparkinfer's own target hardware). Known risk: RTX 5090 cloud
+spot availability was inconsistent as of mid-2026 (limited providers, prices
+swinging $0.50-2.00/hr). Mitigation: don't rely on ad-hoc spot rental for the
+validator box -- either reserve a dedicated instance with a provider confirmed
+to stock 5090s, or run a self-hosted physical 5090 as the GitHub Actions runner
+so PR validation never blocks on spot inventory.
 
 ## Reference model — Gemma 4 E4B
 

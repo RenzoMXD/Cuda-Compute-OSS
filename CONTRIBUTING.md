@@ -114,7 +114,7 @@ them with the **normal (exact)** engine and your **smart** strategy on the
 *identical* inputs, and prints one scorecard.
 
 CCO computes on a **GPU** (CUDA/MPS) via PyTorch — score on a GPU machine
-(reference: A100). The reference regime is **`12000`, full-rank**
+(reference: RTX 5090). The reference regime is **`12000`, full-rank**
 (random) data, which is `eval`'s default.
 
 ```bash
@@ -178,7 +178,7 @@ Every PR description must be exactly this shape:
 
 <what the strategy does, why it is cheaper, and the regime it targets>
 
-## Result   (N=12000, full-rank, A100 (80 GB), fp32)
+## Result   (N=12000, full-rank, RTX 5090, fp32)
 
 | metric          | value          |
 |-----------------|----------------|

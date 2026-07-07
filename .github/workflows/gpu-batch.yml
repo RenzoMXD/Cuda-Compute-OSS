@@ -38,7 +38,7 @@ concurrency:
 
 jobs:
   evaluate:
-    runs-on: [self-hosted, gpu]
+    runs-on: [self-hosted, gpu, rtx-5090]
     steps:
       - uses: actions/checkout@v4
         with:

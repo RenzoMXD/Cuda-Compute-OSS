@@ -31,7 +31,7 @@ If you want to get involved, start here in the repo:
 - **Landing page** — the project overview site: [zeokin.github.io/Cuda-Compute-OSS](https://zeokin.github.io/Cuda-Compute-OSS/index/index.html)
 
 Reference setup: **`12000 × 12000`** matrices, **full-rank** (random) data, on an
-**A100 (80 GB)** GPU via PyTorch.
+**RTX 5090** GPU via PyTorch.
 
 ```bash
 python -m eval --n 12000 --pairs 3        # full-rank is the default
@@ -168,7 +168,7 @@ uv run python -m strategy.smoke
 uv run --extra test python -m pytest tests/ strategy/tests/ eval/tests/ -v
 ```
 
-For a real scorecard, use a GPU machine (reference: A100, 80 GB) and opt into
+For a real scorecard, use a GPU machine (reference: RTX 5090) and opt into
 the GPU extra:
 
 ```bash

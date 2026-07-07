@@ -24,7 +24,7 @@ latency         — mean wall-clock ms of the smart multiply, GPU-synchronized
 VRAM usage      — peak incremental GPU memory during the multiply
 -->
 
-**Regime measured:** N=12000, dtype=fp32, fill=full-rank, rank M=____, device=A100 (80 GB)
+**Regime measured:** N=12000, dtype=fp32, fill=full-rank, rank M=____, device=RTX 5090
 
 <details>
 <summary>Raw scorecard (paste <code>python -m eval …</code> output or <code>--json</code>)</summary>
