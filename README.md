@@ -22,7 +22,7 @@ If you want to get involved, start here in the repo:
 
 - read the project rules in this README
 - read [CONTRIBUTING.md](CONTRIBUTING.md) for the contribution path
-- submit transforms, benchmarks, fixes, and documentation improvements through GitHub
+- submit `fix` PRs for repository bugs or `feat` PRs for measured improvements through GitHub
 
 - **Normal (exact)** engine — the frontier you must beat: [`matmul/`](matmul/)
 - **Smart (approximate)** strategies — where you contribute: [`strategy/`](strategy/)
@@ -82,13 +82,13 @@ which is the part you innovate on.
 > / low-rank inputs are the easy case where the subspace method already wins
 > (see [BENCHMARKS.md](BENCHMARKS.md)).
 
-The loop for a contributor is deliberately small:
+The loop for a contributor now has two lanes:
 
-1. **Add a transform** (or a whole new strategy) — a few lines implementing a
-   basis `Q` (see [CONTRIBUTING.md](CONTRIBUTING.md)).
-2. **Self-score locally** — `python -m eval …` runs your strategy and the exact
-   baseline on identical random couples and prints one scorecard.
-3. **Submit a PR** — paste the scorecard. The numbers, not the prose, decide.
+1. **`fix` lane** — correct a bug, run the CPU-safe validation path, and open a
+   `fix:` PR. No GPU scorecard is required.
+2. **`feat` lane** — add a strategy/performance feature, run the same CPU-safe
+   validation plus `python -m eval ...`, and open a `feat:` PR with the
+   scorecard. The numbers, not the prose, decide.
 
 Every strategy is scored by:
 
@@ -168,8 +168,10 @@ uv run python -m strategy.smoke
 uv run --extra test python -m pytest tests/ strategy/tests/ eval/tests/ -v
 ```
 
-For a real scorecard, use a GPU machine (reference: RTX 5090) and opt into
-the GPU extra:
+That is the full local path for a `fix` PR.
+
+For a `feat` PR and a real scorecard, use a GPU machine (reference: RTX 5090)
+and opt into the GPU extra:
 
 ```bash
 # 4. install PyTorch for GPU scoring
@@ -194,8 +196,10 @@ uv run python strategy/tests/test_subspace.py
 Start at [CONTRIBUTING.md](CONTRIBUTING.md).
 
 If you are arriving from Gittensor and want the fastest route to participation,
-the contribution loop is: implement a change, run `python -m eval ...`, and
-open a PR with the scorecard.
+the contribution loop is:
+
+- for bug fixes: implement the change, run the CPU-safe validation, open a `fix:` PR
+- for improvements: implement the change, run `python -m eval ...`, open a `feat:` PR with the scorecard
 
 ## Repository Layout
 

@@ -1,9 +1,14 @@
 # Contributing to CCO
 
-CCO grows one way: someone submits a **strategy** that multiplies matrices for
-less compute cost without losing accuracy, proves it with the shared scorer, and
-opens a PR. This document is the whole loop — **the one rule**, **self-score
-locally**, **submit**.
+CCO accepts two public PR lanes:
+
+- **`fix` / `bug` PRs** correct mistakes in the repository. They must pass the
+  CPU-safe validation path, but they do **not** need a GPU scorecard.
+- **`feat` / `strategy` PRs** claim an improvement. They must pass the same
+  CPU-safe validation **and** include a GPU scorecard from the shared scorer.
+
+This document defines both lanes: **the one rule**, **local validation**,
+**submit**.
 
 ## Where Gittensor Fits
 
@@ -64,8 +69,47 @@ register_transform("mine", MyTransform)
 ```
 
 That is enough to be scored: `--transform mine`. Bigger contributions (a new
-compression scheme, a better exact tile schedule in `matmul/`) are welcome too
-— the same one rule and the same scorecard apply.
+compression scheme, a better exact tile schedule in `matmul/`) are welcome too.
+
+If your PR is fixing incorrect behavior rather than claiming a new measured
+improvement, submit it through the `fix` lane instead of inventing a scorecard.
+
+---
+
+## Two PR lanes
+
+### `fix` / `bug` lane
+
+Use this lane when the PR corrects repository behavior:
+
+- wrong math
+- validation gaps
+- crashes / OOM routing bugs
+- test coverage for an existing bug
+- docs-only clarifications
+
+What is required:
+
+- title or PR body must declare `fix` / `bug`
+- CPU-safe validation must pass
+- no GPU scorecard is required
+- the PR does **not** enter the GPU queue
+
+### `feat` / `strategy` lane
+
+Use this lane when the PR claims an improvement worth measuring:
+
+- new transform
+- new approximation strategy
+- performance feature
+- algorithmic change that claims lower cost at held accuracy
+
+What is required:
+
+- title or PR body must declare `feat` / `strategy`
+- CPU-safe validation must pass
+- a filled GPU scorecard from `python -m eval ...`
+- the PR enters the sequential GPU queue after non-GPU triage
 
 ---
 
@@ -89,7 +133,7 @@ with a miner scoring submission.
 
 ---
 
-## Self-score locally
+## Local validation
 
 CCO uses **uv**. Install the CPU-safe contributor environment first:
 
@@ -109,9 +153,19 @@ It's a pre-flight, not a score: passing it proves your transform doesn't
 crash, nothing more. The real scorecard always comes from the GPU commands
 below.
 
-Before you open a PR, run the scorer. It generates random couples, multiplies
-them with the **normal (exact)** engine and your **smart** strategy on the
-*identical* inputs, and prints one scorecard.
+Every PR lane starts with the same CPU-safe validation:
+
+```bash
+uv sync --extra test
+uv run python -m strategy.smoke
+uv run --extra test python -m pytest tests/ strategy/tests/ eval/tests/ -v
+```
+
+That is enough for the `fix` lane.
+
+Before you open a `feat` PR, also run the scorer. It generates random couples,
+multiplies them with the **normal (exact)** engine and your **smart** strategy
+on the *identical* inputs, and prints one scorecard.
 
 CCO computes on a **GPU** (CUDA/MPS) via PyTorch — score on a GPU machine
 (reference: RTX 5090). The reference regime is **`12000`, full-rank**
@@ -133,15 +187,7 @@ uv run python -m eval --n 12000 --pairs 3 --transforms mine --json
 uv run python -m eval --n 12000 --pairs 3 --fill lowrank --data-rank 16 --transforms mine
 ```
 
-Then confirm you did not break the gates:
-
-```bash
-uv run python eval/tests/test_eval.py
-uv run python strategy/tests/test_subspace.py
-uv run python tests/test_correctness.py
-```
-
-Rules for an honest local score:
+Rules for an honest local `feat` score:
 
 - Score on **unseen** couples from the same distribution — never special-case the
   seeds, sizes, or matrices the harness uses.
@@ -156,11 +202,15 @@ Rules for an honest local score:
 1. **Fork & branch.** One strategy (or one focused change) per PR.
 2. **Keep it standalone.** `matmul/`, `strategy/`, and `eval/` do not import each
    other except where they already do; don't add cross-coupling.
-3. **Green tests.** All three test suites above must pass.
-4. **Open the PR** and fill in the scorecard. The PR template
+3. **Choose the lane explicitly.** Use `fix:` / `bug:` or `feat:` / `strategy:`
+   in the PR title, or check the matching box in the PR template.
+4. **Green CPU-safe validation.** `strategy.smoke` (if relevant) and
+   `pytest tests/ strategy/tests/ eval/tests/ -v` must pass.
+5. **Open the PR**. The PR template
    ([`.github/PULL_REQUEST_TEMPLATE.md`](.github/PULL_REQUEST_TEMPLATE.md))
-   pre-populates the exact format below — **the numbers, not the prose, decide.**
-5. **Your own work.** A PR that substantially reproduces an earlier PR's diff
+   now has both lanes. `feat` PRs must fill in the GPU scorecard section;
+   `fix` PRs should fill in the validation section instead.
+6. **Your own work.** A PR that substantially reproduces an earlier PR's diff
    is detected automatically and blocked (see
    [`.github/COPYCATS.md`](.github/COPYCATS.md)) — an independently-arrived-at
    similar solution is fine, a copy is not.
@@ -171,14 +221,32 @@ reproducible numbers.
 
 ### PR description format
 
-Every PR description must be exactly this shape:
+Every PR description must declare exactly one lane:
+
+```markdown
+## PR kind
+
+- [x] fix
+- [ ] feat
+```
+
+or:
+
+```markdown
+## PR kind
+
+- [ ] fix
+- [x] feat
+```
+
+For `feat` PRs, include the scorecard:
 
 ```markdown
 ## Summary
 
 <what the strategy does, why it is cheaper, and the regime it targets>
 
-## Result   (N=12000, full-rank, RTX 5090, fp32)
+## GPU Result   (N=12000, full-rank, RTX 5090, fp32)
 
 | metric          | value          |
 |-----------------|----------------|
@@ -198,6 +266,9 @@ Every PR description must be exactly this shape:
 Paste the raw scorecard (or `--json` output) and name the device/dtype you
 measured on, so a reviewer can reproduce your numbers exactly.
 
+For `fix` PRs, replace the scorecard with the concrete bug description and the
+CPU-safe commands you ran.
+
 ### Review & merge
 
 A maintainer reproduces your scorecard on the reference setup, checks the
@@ -207,12 +278,18 @@ scorecard can't be reproduced, the PR goes back for evidence — not rejected fo
 disagreeing with the prose.
 
 The PR bot runs continuously for non-GPU triage. On each PR event and on a
-15-minute schedule it checks drafts, blocked contributors, copycat overlap, and
-scorecard presence. PRs that pass those gates get `status:queued-gpu` and appear
-in `dashboard/data.json` on the `bot/dashboard-state` branch in oldest-PR-first
-order. The dashboard UI itself is expected to live in a separate private
-repository, so `main` stays protected while the bot publishes queue/result data
-to that dedicated state branch.
+15-minute schedule it checks drafts, blocked contributors, copycat overlap, PR
+lane declaration, and scorecard presence when the lane is `feat`.
+
+- `fix` / `bug` / docs PRs are labeled `status:ready-non-gpu` after triage.
+  They do not enter the GPU queue.
+- `feat` / `strategy` PRs that pass those gates get `status:queued-gpu` and
+  appear in `dashboard/data.json` on the `bot/dashboard-state` branch in
+  oldest-PR-first order.
+
+The dashboard UI itself is expected to live in a separate private repository,
+so `main` stays protected while the bot publishes queue/result data to that
+dedicated state branch.
 
 GPU evaluation is intentionally batched. The bot can run all day, but GPU tests
 should run sequentially during one or two maintainer-controlled windows per day.

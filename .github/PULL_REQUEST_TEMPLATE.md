@@ -1,14 +1,37 @@
 <!--
-CCO PR scorecard. The numbers, not the prose, decide.
+CCO has two PR lanes:
+  - fix/bug PRs: CPU-safe validation only, no GPU scorecard required
+  - feat/strategy PRs: score-bearing, GPU scorecard required
+
 Read CONTRIBUTING.md and BENCHMARKS.md before filling this in.
 The one rule: an improvement reduces every cost axis WITHOUT losing accuracy.
 -->
 
+## PR kind
+
+- [ ] fix
+- [ ] feat
+
+<!-- Check exactly one box. The bot and CI use this to route the PR. -->
+
 ## Summary
 
-<!-- What the strategy does, why it is cheaper, and the regime it targets. -->
+<!--
+For fix PRs: explain the bug and the behavior you corrected.
+For feat PRs: explain what the strategy/feature does, why it is cheaper, and
+the regime it targets.
+-->
 
-## Result
+## Validation
+
+<!--
+List the CPU-safe validation you ran.
+Example:
+- uv run python -m strategy.smoke
+- uv run --extra test python -m pytest tests/ strategy/tests/ eval/tests/ -v
+-->
+
+## GPU Result (required for feat PRs only)
 
 | metric          | value          |
 |-----------------|----------------|
@@ -36,12 +59,13 @@ VRAM usage      — peak incremental GPU memory during the multiply
 
 ## Checklist
 
-- [ ] I ran the scorer on **unseen** couples — no hardcoding of seeds/matrices.
-- [ ] Accuracy and latency come from the **same run** at the **same dtype**.
-- [ ] This is an **improvement** (every cost axis down, accuracy held) **or** I
+- [ ] CPU-safe validation passed (`strategy.smoke` if relevant, plus `pytest tests/ strategy/tests/ eval/tests/`).
+- [ ] If this is a feat PR, I ran the scorer on **unseen** couples — no hardcoding of seeds/matrices.
+- [ ] If this is a feat PR, accuracy and latency come from the **same run** at the **same dtype**.
+- [ ] If this is a feat PR, this is an **improvement** (every cost axis down, accuracy held) **or** I
       state honestly which axis it trades — see the one rule in CONTRIBUTING.md.
 - [ ] Correctness gates pass:
       `python eval/tests/test_eval.py`,
       `python strategy/tests/test_subspace.py`,
       `python tests/test_correctness.py`.
-- [ ] I named the device and dtype so a reviewer can reproduce the numbers.
+- [ ] If this is a feat PR, I named the device and dtype so a reviewer can reproduce the numbers.

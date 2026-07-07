@@ -15,8 +15,10 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspa
 from eval import copycat_guard
 from eval.pr_bot import (
     GPU_QUEUE_LABEL,
+    NEEDS_PR_KIND_LABEL,
     NEEDS_SCORECARD_MARKER,
     PROTECTED_PATH_LABEL,
+    READY_NON_GPU_LABEL,
     PRInfo,
     already_evaluated,
     already_queued,
@@ -65,7 +67,7 @@ diff --git a/eval/evaluator.py b/eval/evaluator.py
 
 
 def _pr(number=1, author="alice", is_draft=False, head_sha="sha1", body=SCORECARD_BODY):
-    return PRInfo(number=number, title=f"PR {number}", author=author,
+    return PRInfo(number=number, title=f"feat: PR {number}", author=author,
                  is_draft=is_draft, head_sha=head_sha, body=body)
 
 
@@ -91,6 +93,23 @@ def test_protected_path_is_not_queued():
     out = process_pr(_pr(author="alice"), PROTECTED_DIFF, [], frozenset(), [])
     assert out.action == "protected_path"
     assert out.label == PROTECTED_PATH_LABEL
+
+
+def test_unknown_pr_kind_is_flagged():
+    pr = PRInfo(number=1, title="PR 1", author="alice", is_draft=False, head_sha="sha1",
+                body="Just some changes.")
+    out = process_pr(pr, "diff --git a/matmul/x.py b/matmul/x.py\n+++ b/matmul/x.py\n+pass\n",
+                     [], frozenset(), [])
+    assert out.action == "needs_pr_kind"
+    assert out.label == NEEDS_PR_KIND_LABEL
+
+
+def test_fix_pr_does_not_require_gpu_scorecard():
+    pr = PRInfo(number=1, title="fix: PR 1", author="alice", is_draft=False, head_sha="sha1",
+                body=NO_SCORECARD_BODY)
+    out = process_pr(pr, SOME_DIFF, [], frozenset(), [])
+    assert out.action == "non_gpu_review"
+    assert out.label == READY_NON_GPU_LABEL
 
 
 def test_copycat_block_beats_scorecard_check():
@@ -245,6 +264,17 @@ def test_run_once_live_mode_labels_gpu_queue():
     assert ("remove_label", 1, "status:needs-scorecard") in client.actions
 
 
+def test_run_once_live_mode_labels_fix_pr_non_gpu_ready():
+    pr1 = PRInfo(number=1, title="fix: PR 1", author="alice", is_draft=False, head_sha="sha1",
+                 body=NO_SCORECARD_BODY)
+    client = FakeClient(prs={"all": [pr1], "open": [pr1]}, diffs={1: SOME_DIFF})
+    outcomes = run_once(client, dry_run=False)
+    assert outcomes[0].action == "non_gpu_review"
+    assert ("add_label", 1, READY_NON_GPU_LABEL) in client.actions
+    assert ("remove_label", 1, GPU_QUEUE_LABEL) in client.actions
+    assert not any(a[0] == "post_comment" for a in client.actions)
+
+
 def test_run_once_live_mode_does_not_repeat_queue_comment():
     pr1 = _pr(number=1, author="alice", body=SCORECARD_BODY, head_sha="sha1")
     client = FakeClient(
@@ -309,7 +339,8 @@ def test_run_once_originals_include_prs_between_two_open_ones():
 
 def test_queue_dashboard_orders_ready_prs_oldest_first():
     pr1 = _pr(number=1, author="alice", body=SCORECARD_BODY)
-    pr2 = _pr(number=2, author="bob", body=NO_SCORECARD_BODY)
+    pr2 = PRInfo(number=2, title="fix: PR 2", author="bob", is_draft=False, head_sha="sha1",
+                 body=NO_SCORECARD_BODY)
     pr3 = _pr(number=3, author="carol", body=SCORECARD_BODY)
     outcomes = [
         process_pr(pr1, SOME_DIFF, [], frozenset(), []),
