@@ -13,6 +13,16 @@
       "state": "already_evaluated",
       "title": "[test] exercise mock workflow from fork",
       "url": "https://github.com/zeokin/Cuda-Compute-OSS/pull/109"
+    },
+    {
+      "author": "philluiz2323",
+      "detail": "PR body is missing a filled-in scorecard (see CONTRIBUTING.md)",
+      "head_sha": "c4f6b13af860a833b59cc3f960363f1b52e22099",
+      "label": "status:needs-scorecard",
+      "pr": 110,
+      "state": "needs_scorecard",
+      "title": "fix(matmul): reject non-positive --tile in Config (#80)",
+      "url": "https://github.com/zeokin/Cuda-Compute-OSS/pull/110"
     }
   ],
   "queue": [
@@ -27,5 +37,5 @@
       "url": "https://github.com/zeokin/Cuda-Compute-OSS/pull/109"
     }
   ],
-  "updated": "2026-07-07T13:02:15+00:00"
+  "updated": "2026-07-07T13:11:43+00:00"
 }
