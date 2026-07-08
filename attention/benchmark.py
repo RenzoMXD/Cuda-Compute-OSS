@@ -68,6 +68,7 @@ def run_once(
     global_weight: float = 0.15,
     freq_decay: float = 1.0,
     gate_strength: float = 0.25,
+    temperature: float = 1.0,
     landmarks: int = 64,
     landmark_policy: str = "pooled",
     mode: str = "fixed",
@@ -76,11 +77,16 @@ def run_once(
     device: str = "auto",
 ) -> dict:
     torch = _torch()
-    from .hybrid import adaptive_hybrid_attention, hybrid_attention, landmark_hybrid_attention
+    from .hybrid import (
+        adaptive_hybrid_attention,
+        correlation_hybrid_attention,
+        hybrid_attention,
+        landmark_hybrid_attention,
+    )
     from .reference import exact_attention
 
-    if mode not in {"fixed", "adaptive", "landmark", "topk", "both", "all"}:
-        raise ValueError("mode must be one of: fixed, adaptive, landmark, topk, both, all")
+    if mode not in {"fixed", "adaptive", "corrfft", "landmark", "topk", "both", "all"}:
+        raise ValueError("mode must be one of: fixed, adaptive, corrfft, landmark, topk, both, all")
 
     spec = AttentionSpec(
         batch=batch,
@@ -115,6 +121,18 @@ def run_once(
             global_weight=global_weight,
             freq_decay=freq_decay,
             gate_strength=gate_strength,
+        )
+    if mode in {"corrfft", "all"}:
+        _ = correlation_hybrid_attention(
+            q[:, :, : min(seq, 64), :],
+            k[:, :, : min(seq, 64), :],
+            v[:, :, : min(seq, 64), :],
+            window=min(window, 32),
+            causal=causal,
+            local_weight=local_weight,
+            global_weight=global_weight,
+            temperature=temperature,
+            freq_decay=freq_decay,
         )
     if mode in {"landmark", "topk", "all"}:
         _ = landmark_hybrid_attention(
@@ -153,6 +171,16 @@ def run_once(
             global_weight=global_weight,
             freq_decay=freq_decay,
             gate_strength=gate_strength,
+        )
+    if mode in {"corrfft", "all"}:
+        candidate_fns["corrfft"] = lambda: correlation_hybrid_attention(
+            q, k, v,
+            window=window,
+            causal=causal,
+            local_weight=local_weight,
+            global_weight=global_weight,
+            temperature=temperature,
+            freq_decay=freq_decay,
         )
     if mode in {"landmark", "all"}:
         candidate_fns["landmark"] = lambda: landmark_hybrid_attention(
@@ -204,6 +232,7 @@ def run_once(
             "device": str(dev),
             "mode": mode,
             "gate_strength": gate_strength,
+            "temperature": temperature,
             "landmarks": landmarks,
             "landmark_policy": landmark_policy,
         },
@@ -240,9 +269,10 @@ def main(argv=None) -> int:
     parser.add_argument("--global-weight", type=float, default=0.15)
     parser.add_argument("--freq-decay", type=float, default=1.0)
     parser.add_argument("--gate-strength", type=float, default=0.25)
+    parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--landmarks", type=int, default=64)
     parser.add_argument("--landmark-policy", choices=("pooled", "topk"), default="pooled")
-    parser.add_argument("--mode", choices=("fixed", "adaptive", "landmark", "topk", "both", "all"), default="fixed")
+    parser.add_argument("--mode", choices=("fixed", "adaptive", "corrfft", "landmark", "topk", "both", "all"), default="fixed")
     parser.add_argument("--causal", action="store_true")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", default="auto")
@@ -260,6 +290,7 @@ def main(argv=None) -> int:
         global_weight=args.global_weight,
         freq_decay=args.freq_decay,
         gate_strength=args.gate_strength,
+        temperature=args.temperature,
         landmarks=args.landmarks,
         landmark_policy=args.landmark_policy,
         mode=args.mode,

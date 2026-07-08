@@ -15,6 +15,8 @@ if torch is not None:
     from attention import (
         adaptive_hybrid_attention,
         adaptive_spectral_global_mix,
+        correlation_hybrid_attention,
+        correlation_spectral_global_mix,
         exact_attention,
         generate_qkv,
         hybrid_attention,
@@ -92,6 +94,15 @@ def test_adaptive_spectral_global_mix_preserves_shape_and_finiteness():
     assert torch.isfinite(out).all()
 
 
+def test_correlation_spectral_global_mix_preserves_shape_and_finiteness():
+    if _skip_if_no_torch():
+        return
+    q, k, v = _sample(seq=18, dim=6)
+    out = correlation_spectral_global_mix(q, k, v, temperature=1.0, freq_decay=0.1)
+    assert tuple(out.shape) == tuple(v.shape)
+    assert torch.isfinite(out).all()
+
+
 def test_landmark_global_attention_preserves_shape_and_finiteness():
     if _skip_if_no_torch():
         return
@@ -140,6 +151,21 @@ def test_adaptive_hybrid_equals_local_when_global_weight_is_zero():
     q, k, v = _sample(seq=14, dim=5)
     local = local_window_attention(q, k, v, window=3, block_size=4)
     hybrid = adaptive_hybrid_attention(
+        q, k, v,
+        window=3,
+        block_size=4,
+        local_weight=1.0,
+        global_weight=0.0,
+    )
+    assert torch.allclose(hybrid, local, atol=1e-5, rtol=1e-5)
+
+
+def test_correlation_hybrid_equals_local_when_global_weight_is_zero():
+    if _skip_if_no_torch():
+        return
+    q, k, v = _sample(seq=14, dim=5)
+    local = local_window_attention(q, k, v, window=3, block_size=4)
+    hybrid = correlation_hybrid_attention(
         q, k, v,
         window=3,
         block_size=4,
@@ -219,9 +245,10 @@ def test_attention_benchmark_can_compare_all_modes():
         landmarks=4,
         device="cpu",
     )
-    assert set(result["candidates"]) == {"fixed", "adaptive", "landmark", "topk"}
+    assert set(result["candidates"]) == {"fixed", "adaptive", "corrfft", "landmark", "topk"}
     assert "quality" in result["candidates"]["landmark"]
     assert "quality" in result["candidates"]["topk"]
+    assert "quality" in result["candidates"]["corrfft"]
 
 
 if __name__ == "__main__":

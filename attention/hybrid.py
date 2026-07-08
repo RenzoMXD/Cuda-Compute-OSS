@@ -112,6 +112,62 @@ def adaptive_spectral_global_mix(
     return out.to(v.dtype)
 
 
+def correlation_spectral_global_mix(
+    q,
+    k,
+    v,
+    *,
+    temperature: float = 1.0,
+    freq_decay: float = 0.0,
+    causal: bool = False,
+):
+    """Global FFT mixer using a Q/K-derived lag kernel.
+
+    The kernel is built from average Q/K cross-correlation over sequence lags,
+    then applied to V as a circular convolution in frequency space.
+    """
+    torch = _torch()
+    if temperature <= 0:
+        raise ValueError("temperature must be > 0")
+    if freq_decay < 0:
+        raise ValueError("freq_decay must be >= 0")
+
+    seq = v.shape[-2]
+    real_dtype = torch.float64 if v.dtype == torch.float64 else torch.float32
+    q_work = (q - q.mean(dim=-2, keepdim=True)).to(real_dtype)
+    k_work = (k - k.mean(dim=-2, keepdim=True)).to(real_dtype)
+    v_work = v.to(real_dtype)
+
+    q_norm = torch.linalg.vector_norm(q_work, dim=-1, keepdim=True).clamp_min(1e-6)
+    k_norm = torch.linalg.vector_norm(k_work, dim=-1, keepdim=True).clamp_min(1e-6)
+    q_work = q_work / q_norm
+    k_work = k_work / k_norm
+
+    qf = torch.fft.fft(q_work, dim=-2)
+    kf = torch.fft.fft(k_work, dim=-2)
+    corr = torch.fft.ifft(qf * torch.conj(kf), dim=-2).real.mean(dim=-1).abs()
+
+    if causal:
+        lag_idx = torch.arange(seq, device=v.device)
+        corr = corr.masked_fill(lag_idx.view(1, 1, -1) > seq // 2, float("-inf"))
+
+    kernel = torch.softmax(corr / temperature, dim=-1)
+    delta = torch.zeros_like(kernel)
+    delta[..., 0] = 1.0
+    kernel = 0.5 * delta + 0.5 * kernel
+    if freq_decay > 0:
+        freqs = torch.arange(seq, device=v.device, dtype=real_dtype)
+        decay = 1.0 / (1.0 + freq_decay * torch.minimum(freqs, seq - freqs))
+        kernel = kernel * decay.view(1, 1, -1)
+        kernel = kernel / kernel.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+
+    vf = torch.fft.fft(v_work, dim=-2)
+    kernel_f = torch.fft.fft(kernel, dim=-1)[..., None]
+    mixed = vf * kernel_f
+    out = torch.fft.ifft(mixed, dim=-2).real
+    return out.to(v.dtype)
+
+
 def _pad_to_blocks(x, *, blocks: int):
     torch = _torch()
     seq = x.shape[-2]
@@ -266,6 +322,32 @@ def adaptive_hybrid_attention(
         return local
     global_ = adaptive_spectral_global_mix(
         q, v, freq_decay=freq_decay, gate_strength=gate_strength
+    )
+    return lw * local + gw * global_
+
+
+def correlation_hybrid_attention(
+    q,
+    k,
+    v,
+    *,
+    window: int,
+    causal: bool = False,
+    block_size: int | None = None,
+    local_weight: float = 0.85,
+    global_weight: float = 0.15,
+    temperature: float = 1.0,
+    freq_decay: float = 0.0,
+):
+    """Combine local exact attention with a Q/K correlation FFT global branch."""
+    lw, gw = _normalized_weights(local_weight, global_weight)
+    local = local_window_attention(
+        q, k, v, window=window, causal=causal, block_size=block_size
+    )
+    if gw == 0:
+        return local
+    global_ = correlation_spectral_global_mix(
+        q, k, v, temperature=temperature, freq_decay=freq_decay, causal=causal
     )
     return lw * local + gw * global_
 
