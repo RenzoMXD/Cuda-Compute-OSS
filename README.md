@@ -90,6 +90,16 @@ The loop for a contributor now has two lanes:
    validation plus `python -m eval ...`, and open a `feat:` PR with the
    scorecard. The numbers, not the prose, decide.
 
+Queued `feat` PRs are later re-run in a maintainer-controlled GPU batch and
+receive one final verdict label:
+
+- `eval:L` — large verified improvement
+- `eval:M` — medium verified improvement
+- `eval:S` — small verified improvement that still clears the significance floor
+- `eval:BASELINE` — first admitted strategy on a track
+- `eval:none` — correct, but not a verified frontier improvement
+- `eval:REJECT` — accuracy failed the gate
+
 Every strategy is scored by:
 
 | axis | meaning | better is |
