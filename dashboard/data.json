@@ -18,7 +18,7 @@
       "pr": 110,
       "state": "non_gpu_review",
       "title": "fix(matmul): reject non-positive --tile in Config (#80)",
-      "updated_at": "2026-07-09T17:34:08Z",
+      "updated_at": "2026-07-09T19:13:54Z",
       "url": "https://github.com/zeokin/Cuda-Compute-OSS/pull/110"
     },
     {
@@ -31,7 +31,7 @@
       "pr": 111,
       "state": "non_gpu_review",
       "title": "fix(matmul): budget fp16 fp32-upcast temporaries in _fits_in_core (#63)",
-      "updated_at": "2026-07-09T17:34:12Z",
+      "updated_at": "2026-07-09T19:13:58Z",
       "url": "https://github.com/zeokin/Cuda-Compute-OSS/pull/111"
     },
     {
@@ -44,7 +44,7 @@
       "pr": 112,
       "state": "non_gpu_review",
       "title": "fix(strategy): stream K tiles in multiply_exact for memmap inputs",
-      "updated_at": "2026-07-09T17:34:17Z",
+      "updated_at": "2026-07-09T19:14:02Z",
       "url": "https://github.com/zeokin/Cuda-Compute-OSS/pull/112"
     },
     {
@@ -57,7 +57,7 @@
       "pr": 113,
       "state": "non_gpu_review",
       "title": "fix(storage): thread seed through iota fill so eval couples differ (#104)",
-      "updated_at": "2026-07-09T17:34:21Z",
+      "updated_at": "2026-07-09T19:14:07Z",
       "url": "https://github.com/zeokin/Cuda-Compute-OSS/pull/113"
     },
     {
@@ -70,7 +70,7 @@
       "pr": 116,
       "state": "non_gpu_review",
       "title": "fix(matmul): count the GEMM output tile in auto_tile's VRAM budget",
-      "updated_at": "2026-07-09T17:34:25Z",
+      "updated_at": "2026-07-09T19:14:11Z",
       "url": "https://github.com/zeokin/Cuda-Compute-OSS/pull/116"
     },
     {
@@ -83,7 +83,7 @@
       "pr": 117,
       "state": "non_gpu_review",
       "title": "fix(strategy): size reconstruct() row-block from compute_dtype, not out_dtype",
-      "updated_at": "2026-07-09T17:34:30Z",
+      "updated_at": "2026-07-09T19:14:16Z",
       "url": "https://github.com/zeokin/Cuda-Compute-OSS/pull/117"
     },
     {
@@ -96,7 +96,7 @@
       "pr": 121,
       "state": "non_gpu_review",
       "title": "fix(strategy): honor --keep for --compare disk memmap cleanup",
-      "updated_at": "2026-07-09T17:34:39Z",
+      "updated_at": "2026-07-09T19:14:20Z",
       "url": "https://github.com/zeokin/Cuda-Compute-OSS/pull/121"
     },
     {
@@ -109,10 +109,23 @@
       "pr": 122,
       "state": "non_gpu_review",
       "title": "fix(strategy): split rsvd rank budget three ways, drop redundant col(B)",
-      "updated_at": "2026-07-09T17:34:44Z",
+      "updated_at": "2026-07-09T19:14:25Z",
       "url": "https://github.com/zeokin/Cuda-Compute-OSS/pull/122"
+    },
+    {
+      "author": "RenzoMXD",
+      "detail": "CPU-safe CI only; no GPU scorecard or queue entry required.",
+      "gpu_required": false,
+      "head_sha": "cff3677c0d6a62a3761611997939291354c408aa",
+      "kind": "fix",
+      "label": "status:ready-non-gpu",
+      "pr": 124,
+      "state": "non_gpu_review",
+      "title": "fix(matmul): keep auto tile within tiny budgets",
+      "updated_at": "2026-07-09T20:12:41Z",
+      "url": "https://github.com/zeokin/Cuda-Compute-OSS/pull/124"
     }
   ],
   "queue": [],
-  "updated": "2026-07-09T19:14:27+00:00"
+  "updated": "2026-07-09T20:14:26+00:00"
 }
