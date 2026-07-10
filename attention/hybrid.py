@@ -264,6 +264,13 @@ def landmark_global_attention(
         raise ValueError("num_landmarks must be > 0")
     if policy not in {"pooled", "topk"}:
         raise ValueError("policy must be one of: pooled, topk")
+    if policy == "topk" and causal:
+        # topk selects a single global landmark set from a mean over ALL queries
+        # and a top-k over ALL keys, so out[t] would depend on future q/k -- the
+        # later position mask hides landmark positions, not the future-tainted
+        # selection. A global set cannot be causal, so fall back to the position-
+        # based pooled selection, which is causally correct.
+        policy = "pooled"
 
     _batch, _heads, seq, dim = q.shape
     valid = None
