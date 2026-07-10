@@ -9,71 +9,6 @@
   },
   "open_prs": [
     {
-      "author": "philluiz2323",
-      "detail": "CPU-safe CI only; no GPU scorecard or queue entry required.",
-      "gpu_required": false,
-      "head_sha": "0b3aaeac0051074a4057a41ac4997acf4c13ff08",
-      "kind": "fix",
-      "label": "status:ready-non-gpu",
-      "pr": 127,
-      "state": "non_gpu_review",
-      "title": "fix(strategy): delegate CPUBackend.host_available_bytes to shared cross-platform helper",
-      "updated_at": "2026-07-10T10:32:14Z",
-      "url": "https://github.com/zeokin/Cuda-Compute-OSS/pull/127"
-    },
-    {
-      "author": "RealDiligent",
-      "detail": "CPU-safe CI only; no GPU scorecard or queue entry required.",
-      "gpu_required": false,
-      "head_sha": "75d21ec3e8c1d96875d04741e60d7a0a8a10d0b4",
-      "kind": "fix",
-      "label": "status:ready-non-gpu",
-      "pr": 130,
-      "state": "non_gpu_review",
-      "title": "fix(strategy): stream B in k-blocks inside multiply_exact for memmap inputs",
-      "updated_at": "2026-07-10T10:32:19Z",
-      "url": "https://github.com/zeokin/Cuda-Compute-OSS/pull/130"
-    },
-    {
-      "author": "RealDiligent",
-      "detail": "CPU-safe CI only; no GPU scorecard or queue entry required.",
-      "gpu_required": false,
-      "head_sha": "70354c0ae7d74a25d9639d2f08fa247cfb4be580",
-      "kind": "fix",
-      "label": "status:ready-non-gpu",
-      "pr": 131,
-      "state": "non_gpu_review",
-      "title": "fix(strategy): reserve Q/Ctil VRAM in subspace row-block budgeting",
-      "updated_at": "2026-07-10T10:32:26Z",
-      "url": "https://github.com/zeokin/Cuda-Compute-OSS/pull/131"
-    },
-    {
-      "author": "ultrahighsuper",
-      "detail": "CPU-safe CI only; no GPU scorecard or queue entry required.",
-      "gpu_required": false,
-      "head_sha": "b6473a87eb2a114a990d7aced00b0009857e0c96",
-      "kind": "fix",
-      "label": "status:ready-non-gpu",
-      "pr": 132,
-      "state": "non_gpu_review",
-      "title": "fix(strategy): drop rsvd's redundant col(B) sketch (3-way budget split)",
-      "updated_at": "2026-07-10T10:32:32Z",
-      "url": "https://github.com/zeokin/Cuda-Compute-OSS/pull/132"
-    },
-    {
-      "author": "ultrahighsuper",
-      "detail": "CPU-safe CI only; no GPU scorecard or queue entry required.",
-      "gpu_required": false,
-      "head_sha": "1283181a1d7ccf11353c30daa51686e8b004dfa2",
-      "kind": "fix",
-      "label": "status:ready-non-gpu",
-      "pr": 134,
-      "state": "non_gpu_review",
-      "title": "fix(attention): guard all-masked softmax rows in causal landmark attention",
-      "updated_at": "2026-07-10T10:32:38Z",
-      "url": "https://github.com/zeokin/Cuda-Compute-OSS/pull/134"
-    },
-    {
       "author": "joaovictor91123",
       "detail": "CPU-safe CI only; no GPU scorecard or queue entry required.",
       "gpu_required": false,
@@ -83,49 +18,22 @@
       "pr": 137,
       "state": "non_gpu_review",
       "title": "fix(strategy): state the real default M = min(n, max(64, n//8)) (Fixes #98)",
-      "updated_at": "2026-07-10T10:32:44Z",
+      "updated_at": "2026-07-10T11:19:35Z",
       "url": "https://github.com/zeokin/Cuda-Compute-OSS/pull/137"
     },
     {
-      "author": "joaovictor91123",
-      "detail": "CPU-safe CI only; no GPU scorecard or queue entry required.",
+      "author": "jony376",
+      "detail": "Commit history contains a Co-authored-by footer for a coding agent (for example Cursor, Codex, Claude, Copilot, or similar). CCO does not accept coding-agent co-author footers.",
       "gpu_required": false,
-      "head_sha": "637ba4e964ce6ad75b506ba5e61dfe7d5993eed2",
-      "kind": "fix",
-      "label": "status:ready-non-gpu",
-      "pr": 139,
-      "state": "non_gpu_review",
-      "title": "fix(strategy): budget each streamed block's GEMM output in _row_block (Fixes #138)",
-      "updated_at": "2026-07-10T10:32:50Z",
-      "url": "https://github.com/zeokin/Cuda-Compute-OSS/pull/139"
-    },
-    {
-      "author": "galuis116",
-      "detail": "CPU-safe CI only; no GPU scorecard or queue entry required.",
-      "gpu_required": false,
-      "head_sha": "7530bd9f9f93e30581773541c357b0d7feb4a56f",
-      "kind": "fix",
-      "label": "status:ready-non-gpu",
-      "pr": 140,
-      "state": "non_gpu_review",
-      "title": "fix(runner): guard --verify against OOM on large / disk-backed n",
-      "updated_at": "2026-07-10T10:32:56Z",
-      "url": "https://github.com/zeokin/Cuda-Compute-OSS/pull/140"
-    },
-    {
-      "author": "galuis116",
-      "detail": "CPU-safe CI only; no GPU scorecard or queue entry required.",
-      "gpu_required": false,
-      "head_sha": "1cedc456b0d677a0aca27f6faf9af2c27a3d151a",
-      "kind": "fix",
-      "label": "status:ready-non-gpu",
-      "pr": 143,
-      "state": "non_gpu_review",
-      "title": "fix(attention): correct pooled landmarks when tail padding spans more than one block",
-      "updated_at": "2026-07-10T11:17:17Z",
-      "url": "https://github.com/zeokin/Cuda-Compute-OSS/pull/143"
+      "head_sha": "1d22bb19efd711f55061260eb1e51857517be59c",
+      "kind": null,
+      "pr": 145,
+      "state": "close_coding_agent_coauthor",
+      "title": "fix(strategy): budget GEMM output in multiply_exact tile picker",
+      "updated_at": "2026-07-10T12:47:47Z",
+      "url": "https://github.com/zeokin/Cuda-Compute-OSS/pull/145"
     }
   ],
   "queue": [],
-  "updated": "2026-07-10T11:19:58+00:00"
+  "updated": "2026-07-10T12:49:06+00:00"
 }
