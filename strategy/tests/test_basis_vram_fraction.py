@@ -56,14 +56,15 @@ def _capture_fracs(frac_kwarg="__omit__", n=8, m=4):
 
 
 def test_rsvd_basis_threads_the_configured_fraction():
+    # rsvd captures 3 subspaces (col(A), row(A), row(B)); frac reaches every sketch.
     fracs = _capture_fracs(frac_kwarg=0.15)
-    assert fracs == [0.15, 0.15, 0.15, 0.15], fracs
+    assert fracs == [0.15, 0.15, 0.15], fracs
 
 
 def test_rsvd_basis_defaults_to_streaming_default_when_none():
     d = sub._DEFAULT_ROW_BLOCK_FRACTION
-    assert _capture_fracs(frac_kwarg=None) == [d, d, d, d]
-    assert _capture_fracs(frac_kwarg="__omit__") == [d, d, d, d]
+    assert _capture_fracs(frac_kwarg=None) == [d, d, d]
+    assert _capture_fracs(frac_kwarg="__omit__") == [d, d, d]
 
 
 def test_basis_signatures_accept_frac():
