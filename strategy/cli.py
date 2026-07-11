@@ -48,26 +48,28 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
-    cfg = Config(
-        device=args.device,
-        dtype=args.dtype,
-        rank_m=args.rank_m,
-        transform=args.transform,
-        transform_seed=args.transform_seed,
-        vram_fraction=args.vram_fraction,
-        storage=args.storage,
-        workdir=args.workdir,
-        seed=args.seed,
-        verbose=not args.quiet,
-    )
     try:
+        if args.n < 1:
+            raise ValueError(f"--n must be a positive integer, got {args.n}")
+        cfg = Config(
+            device=args.device,
+            dtype=args.dtype,
+            rank_m=args.rank_m,
+            transform=args.transform,
+            transform_seed=args.transform_seed,
+            vram_fraction=args.vram_fraction,
+            storage=args.storage,
+            workdir=args.workdir,
+            seed=args.seed,
+            verbose=not args.quiet,
+        )
         if args.compare:
             runner.compare(args.n, cfg, fill=args.fill, data_rank=args.data_rank,
                            keep=args.keep)
             return 0
         info = runner.run(args.n, cfg, fill=args.fill, verify=args.verify,
                           keep=args.keep, data_rank=args.data_rank)
-    except (RuntimeError, MemoryError) as e:
+    except (ValueError, RuntimeError, MemoryError) as e:
         print(f"error: {e}", file=sys.stderr)
         return 2
     if args.quiet:
