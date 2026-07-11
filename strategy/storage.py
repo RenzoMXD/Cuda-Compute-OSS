@@ -42,7 +42,7 @@ def _fill_lowrank(mat: np.ndarray, seed: int, rank: int) -> None:
     This is the regime where the subspace strategy is accurate."""
     n = mat.shape[0]
     rng = np.random.default_rng(seed)
-    scale = 1.0 / np.sqrt(rank)
+    scale = 1.0 / np.sqrt(rank) if rank > 0 else 0.0
     V = (rng.standard_normal((rank, n)) * scale).astype(np.float64)
     block = max(1, min(n, (256 * 1024**2) // (n * 8)))
     for r0 in range(0, n, block):
@@ -61,7 +61,7 @@ def _fill_decaying_spectrum(mat: np.ndarray, seed: int, rank: int, alpha: float 
     structure rather than needing the full rank to be accurate."""
     n = mat.shape[0]
     rng = np.random.default_rng(seed)
-    scale = 1.0 / np.sqrt(rank)
+    scale = 1.0 / np.sqrt(rank) if rank > 0 else 0.0
     V = (rng.standard_normal((rank, n)) * scale).astype(np.float64)
     weights = np.arange(1, rank + 1, dtype=np.float64) ** -alpha
     V *= weights[:, None]
@@ -106,10 +106,10 @@ def generate(
     elif fill == "zeros":
         mat[:] = 0
     elif fill == "lowrank":
-        r = data_rank or max(1, n // 32)
+        r = data_rank if data_rank is not None else max(1, n // 32)
         _fill_lowrank(mat, seed, min(r, n))
     elif fill == "decaying-spectrum":
-        r = data_rank or max(1, n // 32)
+        r = data_rank if data_rank is not None else max(1, n // 32)
         _fill_decaying_spectrum(mat, seed, min(r, n), spectral_alpha)
     else:
         raise ValueError(f"unknown fill {fill!r}")
