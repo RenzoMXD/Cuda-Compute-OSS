@@ -150,10 +150,18 @@ def reconstruct(Ctil, Q, C_out, backend: Backend, out_dtype,
     """
     n, m = Q.shape
     item_dtype = compute_dtype if compute_dtype is not None else out_dtype
+    item = np.dtype(item_dtype).itemsize
     # per row: the (rb, n) product plus the (rb, m) intermediate Q[rb] @ Ctil,
-    # which is still live while the outer matmul against QT runs.
-    blk = _row_block(n, n, backend, np.dtype(item_dtype).itemsize, frac,
-                     out_cols=m)
+    # which is still live while the outer matmul against QT runs. Q (n, m) and
+    # Ctil (m, m) are also both fully resident for the entire loop -- unlike
+    # the streamed inputs elsewhere in this module, they arrive already on the
+    # device and are never staged per block. That is a fixed n*m + m*m cost
+    # that does not shrink with the block, so it must be taken off the budget
+    # up front (cf. stream_gemm_right's resident output, stream_gemm_left_t's
+    # resident accumulator) rather than left to a live free-memory reading
+    # that, on MPS, is a static ceiling and never reflects it at all.
+    blk = _row_block(n, n, backend, item, frac,
+                     out_cols=m, fixed_bytes=(n * m + m * m) * item)
     QT = Q.T
     for r0 in range(0, n, blk):
         r1 = min(n, r0 + blk)
