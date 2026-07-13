@@ -1,5 +1,5 @@
 {
-  "updated": "2026-07-13T14:03:55+00:00",
+  "updated": "2026-07-13T14:18:06+00:00",
   "status": {
     "gpu": "NVIDIA RTX PRO 500 Blackwell Generation Laptop GPU",
     "tracks": {
@@ -8,7 +8,7 @@
         "accuracy_floor": 0.9
       },
       "full-rank": {
-        "frontier_score": 10.4,
+        "frontier_score": 0.0,
         "accuracy_floor": 0.8
       },
       "low-rank": {
@@ -22,15 +22,7 @@
       "landed": []
     },
     "full-rank": {
-      "landed": [
-        {
-          "name": "mock_transform",
-          "pr": 109,
-          "date": "2026-07-07T13:06:09+00:00",
-          "score": 10.4,
-          "label": "BASELINE"
-        }
-      ]
+      "landed": []
     },
     "low-rank": {
       "landed": [
@@ -52,28 +44,6 @@
     }
   },
   "prs": [
-    {
-      "num": 109,
-      "title": "[test] exercise mock workflow from fork",
-      "track": "full-rank",
-      "label": "BASELINE",
-      "accuracy": 0.94,
-      "latency_s": 0.023,
-      "peak_vram_mib": 1536.0,
-      "flop_ratio": 2.5,
-      "url": "https://github.com/zeokin/Cuda-Compute-OSS/pull/109"
-    },
-    {
-      "num": 114,
-      "title": "feat: allow targeted strategy smoke checks",
-      "track": "full-rank",
-      "label": "none",
-      "accuracy": 0.94,
-      "latency_s": 0.021,
-      "peak_vram_mib": 1536.0,
-      "flop_ratio": 2.5,
-      "url": "https://github.com/zeokin/Cuda-Compute-OSS/pull/114"
-    },
     {
       "num": 156,
       "title": "feat(strategy): rsvd captures 3 subspaces, not 4 (drop redundant col(B) sketch)",
