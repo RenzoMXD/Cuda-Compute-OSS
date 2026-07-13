@@ -66,8 +66,14 @@ def main(argv=None) -> int:
             verbose=not args.quiet,
         )
         if args.compare:
-            runner.compare(args.n, cfg, fill=args.fill, data_rank=args.data_rank,
-                           keep=args.keep)
+            out = runner.compare(args.n, cfg, fill=args.fill, data_rank=args.data_rank,
+                                 keep=args.keep)
+            if args.quiet:
+                # compare() only prints when verbose (i.e. not --quiet), so
+                # without this a --compare --quiet run produced NO output at all.
+                print(f"exact {out['exact_seconds']:.4f}s  "
+                      f"smart {out['smart_seconds']:.4f}s  "
+                      f"speedup {out['speedup']:.2f}x  rel_err {out['rel_err']:.2e}")
             return 0
         info = runner.run(args.n, cfg, fill=args.fill, verify=args.verify,
                           keep=args.keep, data_rank=args.data_rank)
