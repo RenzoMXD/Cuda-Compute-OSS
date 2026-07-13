@@ -30,7 +30,7 @@
       "pr": 212,
       "state": "non_gpu_review",
       "title": "fix(attention): benchmark CLI reports invalid knobs cleanly (exit 2), not a traceback (Fixes #201)",
-      "updated_at": "2026-07-13T06:07:15Z",
+      "updated_at": "2026-07-13T06:31:38Z",
       "url": "https://github.com/zeokin/Cuda-Compute-OSS/pull/212"
     },
     {
@@ -43,7 +43,7 @@
       "pr": 215,
       "state": "non_gpu_review",
       "title": "fix(strategy): stop reporting a <1x FLOP ratio as \"fewer FLOPs than exact\"",
-      "updated_at": "2026-07-13T06:07:21Z",
+      "updated_at": "2026-07-13T06:31:44Z",
       "url": "https://github.com/zeokin/Cuda-Compute-OSS/pull/215"
     },
     {
@@ -56,7 +56,7 @@
       "pr": 216,
       "state": "non_gpu_review",
       "title": "fix(strategy): budget reconstruct()'s resident Q/Ctil, not just the per-row stream",
-      "updated_at": "2026-07-13T06:07:27Z",
+      "updated_at": "2026-07-13T06:31:50Z",
       "url": "https://github.com/zeokin/Cuda-Compute-OSS/pull/216"
     },
     {
@@ -69,7 +69,7 @@
       "pr": 214,
       "state": "non_gpu_review",
       "title": "fix(attention): report invalid benchmark args as a clean error, not a traceback (Fixes #201)",
-      "updated_at": "2026-07-13T06:07:34Z",
+      "updated_at": "2026-07-13T06:31:57Z",
       "url": "https://github.com/zeokin/Cuda-Compute-OSS/pull/214"
     },
     {
@@ -82,7 +82,7 @@
       "pr": 156,
       "state": "eval_pending",
       "title": "feat(strategy): rsvd captures 3 subspaces, not 4 (drop redundant col(B) sketch)",
-      "updated_at": "2026-07-13T06:07:45Z",
+      "updated_at": "2026-07-13T06:32:08Z",
       "url": "https://github.com/zeokin/Cuda-Compute-OSS/pull/156"
     },
     {
@@ -95,7 +95,7 @@
       "pr": 185,
       "state": "eval_pending",
       "title": "feat(strategy): subspace-iteration transform for decaying spectra",
-      "updated_at": "2026-07-13T06:07:51Z",
+      "updated_at": "2026-07-13T06:32:14Z",
       "url": "https://github.com/zeokin/Cuda-Compute-OSS/pull/185"
     },
     {
@@ -108,7 +108,7 @@
       "pr": 192,
       "state": "eval_pending",
       "title": "feat(strategy): add fixed DCT-II basis transform for smooth data",
-      "updated_at": "2026-07-13T06:07:58Z",
+      "updated_at": "2026-07-13T06:32:20Z",
       "url": "https://github.com/zeokin/Cuda-Compute-OSS/pull/192"
     },
     {
@@ -121,7 +121,7 @@
       "pr": 194,
       "state": "eval_pending",
       "title": "feat(strategy): add nystrom landmark-column transform for low-rank data",
-      "updated_at": "2026-07-13T06:08:04Z",
+      "updated_at": "2026-07-13T06:32:27Z",
       "url": "https://github.com/zeokin/Cuda-Compute-OSS/pull/194"
     },
     {
@@ -134,7 +134,7 @@
       "pr": 209,
       "state": "non_gpu_review",
       "title": "fix(matmul): validate dtype in the public matmul() API up front (Fixes #208)",
-      "updated_at": "2026-07-13T06:08:07Z",
+      "updated_at": "2026-07-13T06:32:29Z",
       "url": "https://github.com/zeokin/Cuda-Compute-OSS/pull/209"
     },
     {
@@ -147,7 +147,7 @@
       "pr": 211,
       "state": "non_gpu_review",
       "title": "fix(strategy): honour --vram-fraction in rsvd basis construction",
-      "updated_at": "2026-07-13T06:08:13Z",
+      "updated_at": "2026-07-13T06:32:35Z",
       "url": "https://github.com/zeokin/Cuda-Compute-OSS/pull/211"
     },
     {
@@ -160,7 +160,7 @@
       "pr": 218,
       "state": "non_gpu_review",
       "title": "fix(docs): list the decaying-spectrum fill in strategy README --fill flags",
-      "updated_at": "2026-07-13T06:08:20Z",
+      "updated_at": "2026-07-13T06:32:41Z",
       "url": "https://github.com/zeokin/Cuda-Compute-OSS/pull/218"
     },
     {
@@ -173,7 +173,7 @@
       "pr": 219,
       "state": "non_gpu_review",
       "title": "fix(attention): build the QKV generator on the tensors' device (fixes cuda:N mismatch)",
-      "updated_at": "2026-07-13T06:28:47Z",
+      "updated_at": "2026-07-13T06:32:48Z",
       "url": "https://github.com/zeokin/Cuda-Compute-OSS/pull/219"
     }
   ],
@@ -189,7 +189,7 @@
       "pr": 156,
       "state": "eval_pending",
       "title": "feat(strategy): rsvd captures 3 subspaces, not 4 (drop redundant col(B) sketch)",
-      "updated_at": "2026-07-13T06:07:45Z",
+      "updated_at": "2026-07-13T06:32:08Z",
       "url": "https://github.com/zeokin/Cuda-Compute-OSS/pull/156"
     },
     {
@@ -203,7 +203,7 @@
       "pr": 185,
       "state": "eval_pending",
       "title": "feat(strategy): subspace-iteration transform for decaying spectra",
-      "updated_at": "2026-07-13T06:07:51Z",
+      "updated_at": "2026-07-13T06:32:14Z",
       "url": "https://github.com/zeokin/Cuda-Compute-OSS/pull/185"
     },
     {
@@ -217,7 +217,7 @@
       "pr": 192,
       "state": "eval_pending",
       "title": "feat(strategy): add fixed DCT-II basis transform for smooth data",
-      "updated_at": "2026-07-13T06:07:58Z",
+      "updated_at": "2026-07-13T06:32:20Z",
       "url": "https://github.com/zeokin/Cuda-Compute-OSS/pull/192"
     },
     {
@@ -231,9 +231,9 @@
       "pr": 194,
       "state": "eval_pending",
       "title": "feat(strategy): add nystrom landmark-column transform for low-rank data",
-      "updated_at": "2026-07-13T06:08:04Z",
+      "updated_at": "2026-07-13T06:32:27Z",
       "url": "https://github.com/zeokin/Cuda-Compute-OSS/pull/194"
     }
   ],
-  "updated": "2026-07-13T06:32:52+00:00"
+  "updated": "2026-07-13T06:43:21+00:00"
 }
