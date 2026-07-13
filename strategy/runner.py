@@ -52,42 +52,47 @@ def run(n: int, cfg: Config, fill: str = "lowrank", verify: bool = False,
         print(f"[strategy] storage    : {'disk memmap' if on_disk else 'RAM'}"
               f"{' @ ' + cfg.workdir if on_disk else ''}")
 
-    A = storage.generate(n, dt, on_disk, pa if on_disk else None, cfg.seed, fill,
-                         data_rank=data_rank)
-    B = storage.generate(n, dt, on_disk, pb if on_disk else None, cfg.seed + 1, fill,
-                         data_rank=data_rank)
-    C = storage.allocate(n, dt, on_disk, pc if on_disk else None)
+    try:
+        A = storage.generate(n, dt, on_disk, pa if on_disk else None, cfg.seed, fill,
+                             data_rank=data_rank)
+        B = storage.generate(n, dt, on_disk, pb if on_disk else None, cfg.seed + 1, fill,
+                             data_rank=data_rank)
+        C = storage.allocate(n, dt, on_disk, pc if on_disk else None)
 
-    info = {}
-    elapsed = _timed(lambda: info.update(subspace.multiply_subspace(A, B, C, backend, cfg)),
-                     backend)
+        info = {}
+        elapsed = _timed(lambda: info.update(subspace.multiply_subspace(A, B, C, backend, cfg)),
+                         backend)
 
-    info.update(seconds=elapsed, gflops=2.0 * n**3 / elapsed / 1e9,
-                storage="disk" if on_disk else "ram")
+        info.update(seconds=elapsed, gflops=2.0 * n**3 / elapsed / 1e9,
+                    storage="disk" if on_disk else "ram")
 
-    if cfg.verbose:
-        print(f"[strategy] mode       : {info['mode']}")
-        print(f"[strategy] time       : {elapsed:.4f} s")
-        print(f"[strategy] equiv-tput : {info['gflops']:.1f} GFLOP/s (vs 2N^3 work)")
-        print(f"[strategy] flop saved : {info['flop_exact'] / info['flop_actual']:.1f}x "
-              f"fewer FLOPs than exact")
-
-    if verify:
-        info["verify"] = _verify(A, B, C, n, cfg, backend)
         if cfg.verbose:
-            v = info["verify"]
-            if v.get("skipped"):
-                print(f"[strategy] rel. error : skipped ({v['skipped']})")
-            else:
-                print(f"[strategy] rel. error : {v['max_rel_err']:.2e} "
-                      f"(approximate by design)")
+            print(f"[strategy] mode       : {info['mode']}")
+            print(f"[strategy] time       : {elapsed:.4f} s")
+            print(f"[strategy] equiv-tput : {info['gflops']:.1f} GFLOP/s (vs 2N^3 work)")
+            print(f"[strategy] flop saved : {info['flop_exact'] / info['flop_actual']:.1f}x "
+                  f"fewer FLOPs than exact")
 
-    if on_disk and not keep:
-        for p in (pa, pb, pc):
-            try:
-                os.remove(p)
-            except OSError:
-                pass
+        if verify:
+            info["verify"] = _verify(A, B, C, n, cfg, backend)
+            if cfg.verbose:
+                v = info["verify"]
+                if v.get("skipped"):
+                    print(f"[strategy] rel. error : skipped ({v['skipped']})")
+                else:
+                    print(f"[strategy] rel. error : {v['max_rel_err']:.2e} "
+                          f"(approximate by design)")
+    finally:
+        # Disk-backed A/B/C must not survive a crash any more than a clean run
+        # -- without a finally, an exception anywhere above (backend init, the
+        # multiply itself, verify) skipped this and leaked the files, --keep
+        # or not.
+        if on_disk and not keep:
+            for p in (pa, pb, pc):
+                try:
+                    os.remove(p)
+                except OSError:
+                    pass
     return info
 
 
@@ -128,40 +133,44 @@ def compare(n: int, cfg: Config, fill: str = "lowrank",
                       os.path.join(cfg.workdir, "Ce.dat"),
                       os.path.join(cfg.workdir, "Cs.dat"))
 
-    A = storage.generate(n, dt, on_disk, pa if on_disk else None, cfg.seed, fill,
-                         data_rank=data_rank)
-    B = storage.generate(n, dt, on_disk, pb if on_disk else None, cfg.seed + 1, fill,
-                         data_rank=data_rank)
-    Ce = storage.allocate(n, dt, on_disk, pe if on_disk else None)
-    Cs = storage.allocate(n, dt, on_disk, ps if on_disk else None)
+    try:
+        A = storage.generate(n, dt, on_disk, pa if on_disk else None, cfg.seed, fill,
+                             data_rank=data_rank)
+        B = storage.generate(n, dt, on_disk, pb if on_disk else None, cfg.seed + 1, fill,
+                             data_rank=data_rank)
+        Ce = storage.allocate(n, dt, on_disk, pe if on_disk else None)
+        Cs = storage.allocate(n, dt, on_disk, ps if on_disk else None)
 
-    ex = {}
-    ex_t = _timed(lambda: ex.update(subspace.multiply_exact(A, B, Ce, backend, cfg)), backend)
-    sm = {}
-    sm_t = _timed(lambda: sm.update(subspace.multiply_subspace(A, B, Cs, backend, cfg)), backend)
+        ex = {}
+        ex_t = _timed(lambda: ex.update(subspace.multiply_exact(A, B, Ce, backend, cfg)), backend)
+        sm = {}
+        sm_t = _timed(lambda: sm.update(subspace.multiply_subspace(A, B, Cs, backend, cfg)), backend)
 
-    rel_err = _rel_frobenius_streamed(Ce, Cs)
-    speedup = ex_t / sm_t if sm_t else float("inf")
-    out = {
-        "n": n, "exact_seconds": ex_t, "smart_seconds": sm_t,
-        "speedup": speedup, "rel_err": rel_err,
-        "flop_ratio": sm["flop_exact"] / sm["flop_actual"],
-        "exact_mode": ex["mode"], "smart_mode": sm["mode"],
-    }
-    if cfg.verbose:
-        print("\n--- normal (exact) vs smart (subspace) ---")
-        print(f"  exact : {ex_t:.4f}s   ({ex['mode']})")
-        print(f"  smart : {sm_t:.4f}s   ({sm['mode']})")
-        print(f"  speedup(exact/smart) : {speedup:.2f}x")
-        print(f"  smart FLOPs          : {out['flop_ratio']:.1f}x fewer than exact")
-        print(f"  smart rel. error     : {rel_err:.2e}")
-
-    if on_disk and not keep:
-        for p in (pa, pb, pe, ps):
-            try:
-                os.remove(p)
-            except OSError:
-                pass
+        rel_err = _rel_frobenius_streamed(Ce, Cs)
+        speedup = ex_t / sm_t if sm_t else float("inf")
+        out = {
+            "n": n, "exact_seconds": ex_t, "smart_seconds": sm_t,
+            "speedup": speedup, "rel_err": rel_err,
+            "flop_ratio": sm["flop_exact"] / sm["flop_actual"],
+            "exact_mode": ex["mode"], "smart_mode": sm["mode"],
+        }
+        if cfg.verbose:
+            print("\n--- normal (exact) vs smart (subspace) ---")
+            print(f"  exact : {ex_t:.4f}s   ({ex['mode']})")
+            print(f"  smart : {sm_t:.4f}s   ({sm['mode']})")
+            print(f"  speedup(exact/smart) : {speedup:.2f}x")
+            print(f"  smart FLOPs          : {out['flop_ratio']:.1f}x fewer than exact")
+            print(f"  smart rel. error     : {rel_err:.2e}")
+    finally:
+        # Same exception-safety gap as run(): the exact and smart multiplies
+        # (and _rel_frobenius_streamed) can all raise, and without a finally
+        # this cleanup was simply never reached on that path -- --keep or not.
+        if on_disk and not keep:
+            for p in (pa, pb, pe, ps):
+                try:
+                    os.remove(p)
+                except OSError:
+                    pass
     return out
 
 
