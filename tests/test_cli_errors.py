@@ -107,5 +107,13 @@ def test_attention_benchmark_bad_args_exit_cleanly(argv, capsys):
     assert "error:" in capsys.readouterr().err
 
 
+def test_strategy_unknown_transform_exits_cleanly(capsys):
+    rc = strategy_cli.main(["--n", "8", "--transform", "nope", "--quiet"])
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert "error:" in err
+    assert "unknown transform" in err
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))

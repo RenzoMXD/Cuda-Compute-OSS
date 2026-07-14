@@ -6,7 +6,7 @@ import sys
 
 from .config import Config, DTYPES
 from . import runner
-from .transforms import available as available_transforms
+from .transforms import available as available_transforms, get_transform
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -67,13 +67,14 @@ def main(argv=None) -> int:
             seed=args.seed,
             verbose=not args.quiet,
         )
+        get_transform(cfg.transform, cfg.transform_seed)
         if args.compare:
             runner.compare(args.n, cfg, fill=args.fill, data_rank=args.data_rank,
                            keep=args.keep)
             return 0
         info = runner.run(args.n, cfg, fill=args.fill, verify=args.verify,
                           keep=args.keep, data_rank=args.data_rank)
-    except (ValueError, RuntimeError, MemoryError) as e:
+    except (ValueError, RuntimeError, MemoryError, KeyError) as e:
         print(f"error: {e}", file=sys.stderr)
         return 2
     if args.quiet:
