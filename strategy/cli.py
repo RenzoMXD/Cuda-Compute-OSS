@@ -53,6 +53,8 @@ def main(argv=None) -> int:
             raise ValueError(f"--n must be a positive integer, got {args.n}")
         if args.data_rank is not None and args.data_rank < 1:
             raise ValueError(f"--data-rank must be a positive integer, got {args.data_rank}")
+        if args.rank_m is not None and args.rank_m < 1:
+            raise ValueError(f"--rank-m must be a positive integer, got {args.rank_m}")
         cfg = Config(
             device=args.device,
             dtype=args.dtype,

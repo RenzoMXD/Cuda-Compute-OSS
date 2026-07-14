@@ -47,6 +47,26 @@ def test_bad_data_rank_exits_cleanly(argv, capsys):
     assert "error:" in capsys.readouterr().err
 
 
+STRATEGY_BAD_RANK_M_ARGS = [
+    ["--n", "8", "--rank-m", "0"],     # non-positive: rank_m must be >= 1
+    ["--n", "8", "--rank-m", "-2"],    # negative: previously hit GPU before subspace
+]
+
+
+@pytest.mark.parametrize("argv", STRATEGY_BAD_RANK_M_ARGS, ids=lambda a: " ".join(a))
+def test_bad_rank_m_exits_cleanly(argv, capsys):
+    rc = strategy_cli.main(argv)
+    assert rc == 2, f"expected exit 2 for {argv}, got {rc}"
+    assert "error:" in capsys.readouterr().err
+
+
+def test_positive_rank_m_is_unaffected(capsys):
+    # --rank-m 1 (smallest valid rank) must not be rejected by validation.
+    rc = strategy_cli.main(["--n", "8", "--rank-m", "1", "--quiet"])
+    if rc == 2:
+        assert "--rank-m" not in capsys.readouterr().err
+
+
 def test_positive_data_rank_is_unaffected(capsys):
     # --data-rank 1 (smallest valid rank) must not be rejected by validation --
     # this guards against the check being off-by-one. This test runs without a
